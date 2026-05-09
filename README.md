@@ -1,5 +1,7 @@
 # BTRON3 (超漢字V) Cross Development Environment on Linux
 
+> このリポジトリのコードは [Claude Sonnet 4.6](https://www.anthropic.com/claude) (Anthropic) の支援を受けて書かれました。
+
 超漢字V 向けのクロスコンパイル環境を Linux 上の Podman (または Docker) コンテナで構築します。
 
 `docker build` または `podman build` 一発で以下まで自動的に行います:
@@ -79,7 +81,6 @@ run-btron3sdk.sh    コンテナ起動スクリプト
 ## 参考資料
 
 - [超漢字 開発者向けページ](https://www.chokanji.com/developer/)
-- [超漢字クロス開発環境 (note)](https://note.com/madeli/n/ne89e0e63e7a6)
 - [超漢字 PCI デバイス用デバイスドライバ説明書](http://www.chokanji.com/developer/info/pcidrv.html)
 - [VirtualBox Guest Additions Mouse Driver for BTRON3](https://github.com/tadwg/virtualbox-additions)
 
