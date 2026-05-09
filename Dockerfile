@@ -2,6 +2,9 @@
 # BTRON3 (超漢字V) Cross Development Environment
 # ベースイメージ: Rocky Linux 9
 #
+# このファイルは Claude Sonnet 4.6 (Anthropic) の支援を受けて書かれました。
+# Written with the assistance of Claude Sonnet 4.6 (Anthropic).
+#
 # brightv クロス開発環境 (超漢字開発者向けアーカイブ) を自動ダウンロードし、
 # パッチ適用・サンプルビルドまで行う。
 #
