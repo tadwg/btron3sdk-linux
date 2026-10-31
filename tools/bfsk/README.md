@@ -41,9 +41,9 @@ python3 tools/bfsk/bfsk.py [-p N | -n FSNAME] IMAGE COMMAND [OPTIONS] [PATH...]
 
 ```
 $ bfsk.py a.vmdk ls -l /
-ATYPE ATR  NREC  NLNK  NREF       SIZE    BLK  MTIME                NAME
-0003  ----     1     0     1      31936      2  2024-02-13 06:21:11  ＳＢＯＯＴ
-0003  ----     1     0     1     251672      9  2024-02-13 06:21:11  ＢＴＲＯＮ．ＳＹＳ
+ATYPE ATR   NREC  NLNK  NREF       SIZE    BLK  MTIME                NAME
+0003  H----     1     0     1      31936      2  2024-02-13 06:21:11  ＳＢＯＯＴ
+0003  H----     1     0     1     251672      9  2024-02-13 06:21:11  ＢＴＲＯＮ．ＳＹＳ
 ...
 
 $ bfsk.py a.vmdk fs -l -i 83
@@ -60,6 +60,10 @@ $ bfsk.py a.vmdk tp -a STARTUP.CMD | head -3
 $ bfsk.py a.vmdk tp BTRON.SYS > btron.sys      # レコード 0 をファイルに保存
 $ bfsk.py a.vmdk tp -r 11 -x -i 83 | head       # 16 進ダンプ
 ```
+
+`ls -l` の ATR は CLI と同じく `H` 隠蔽仮身、`P` 削除不可、`R` 書込不可、`1`/`2` アプリケーション属性です。
+`H` はファイルではなくリンク (仮身) 側の属性で、属性データ1 の 0x8000 です (実身/仮身マネージャ 3.8.3.1 図123)。
+`-i` でファイル ID を指定した場合はたどったリンクが無いため `H` は表示されません。
 
 `tp` は端末に直接生データを出そうとするとエラーにします (リダイレクトするか `-a` / `-x` / `-b` を指定)。
 複数ブロックにまたがるレコードは連結して出力します。
@@ -124,4 +128,6 @@ $ bfsk.py a.vmdk tp -r 11 -x -i 83 | head       # 16 進ダンプ
 ## 参考資料
 
 - [TRON 仕様 第4章 フロッピーディスク形式 (付録 A 準標準フロッピーディスク形式、付録 B 実現例)](https://www.chokanji.com/developer/doc/btron3/shared_data/fd_format.html)
+- [BTRON3 仕様 1.6 ファイル管理 (パス名と出現順、リンクファイル)](https://www.chokanji.com/developer/doc/btron3/os_spec/kernel/file.html)
+- [BTRON3 仕様 3.8 実身/仮身マネージャ (仮身の属性)](https://www.chokanji.com/developer/doc/btron3/os_spec/shell/omgr.html)
 - [超漢字V R4 仕様差分 (拡張形式2)](https://www.chokanji.com/developer/doc/brightv.r4/diff/diff.html#section04)

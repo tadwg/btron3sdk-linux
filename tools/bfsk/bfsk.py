@@ -390,8 +390,8 @@ class BFile:
         return self.ref
 
     def links(self):
-        """リンクレコードのみ: [(レコード番号, リンク先 fid)]."""
-        return [(i, r['link_fid']) for i, r in enumerate(self.records()) if r['kind'] == 'link']
+        """リンクレコードのみ: [(レコード番号, リンク先 fid, 属性データ1〜5)]."""
+        return [(i, r['link_fid'], r['attrs']) for i, r in enumerate(self.records()) if r['kind'] == 'link']
 
     def records(self):
         """レコードの一覧を返す (dict のリスト)."""
@@ -486,6 +486,7 @@ class Resolver:
     def __init__(self, disk):
         self.d = disk
         self._cache = {}
+        self.link_attrs = {}            # 解決したパス → そこへ至るリンクの属性データ1〜5
 
     def file(self, fid):
         f = self._cache.get(fid)
@@ -494,10 +495,10 @@ class Resolver:
         return f
 
     def children(self, f):
-        """(表示名, fid) の列. 同名 2 つ目以降は "名前:N"."""
+        """(表示名, 名前, 出現順, fid, リンク属性) の列. 同名 2 つ目以降は "名前:N"."""
         seen = {}
         out = []
-        for _, fid in f.links():
+        for _, fid, attrs in f.links():
             try:
                 name = self.file(fid).name
             except FormatError:
@@ -505,35 +506,40 @@ class Resolver:
             key = norm_name(name)
             n = seen.get(key, 0)
             seen[key] = n + 1
-            out.append((name if n == 0 else '%s:%d' % (name, n), name, n, fid))
+            out.append((name if n == 0 else '%s:%d' % (name, n), name, n, fid, attrs))
         return out
 
     def resolve(self, path):
         """パスに一致する [(表示パス, BFile)] を返す (ワイルドカードで複数あり得る)."""
-        results = [([], [0])]           # (表示名リスト, fid スタック)
+        results = [([], [0], None)]     # (表示名リスト, fid スタック, 最後にたどったリンクの属性)
         for toks in split_path(path):
             word = ''.join(ch for _, ch in toks)
             nxt = []
-            for names, stack in results:
+            for names, stack, la in results:
                 if word == '.' and all(t == 'lit' for t, _ in toks):
-                    nxt.append((names, stack))
+                    nxt.append((names, stack, la))
                     continue
                 if word == '..' and all(t == 'lit' for t, _ in toks):
-                    nxt.append((names[:-1], stack[:-1] or [0]))
+                    nxt.append((names[:-1], stack[:-1] or [0], None))
                     continue
                 pat, wild, occ = parse_comp(toks)
-                for disp, name, n, fid in self.children(self.file(stack[-1])):
+                for disp, name, n, fid, attrs in self.children(self.file(stack[-1])):
                     if not fnmatch.fnmatchcase(norm_name(name), pat):
                         continue
                     if occ is not None and n != occ:
                         continue
                     if occ is None and not wild and n != 0:
                         continue
-                    nxt.append((names + [disp], stack + [fid]))
+                    nxt.append((names + [disp], stack + [fid], attrs))
             results = nxt
         if not results:
             raise FormatError('%s: ファイルが見つかりません' % path)
-        return [('/' + '/'.join(n), self.file(st[-1])) for n, st in results]
+        out = []
+        for n, st, la in results:
+            p = '/' + '/'.join(n)
+            self.link_attrs[p] = la
+            out.append((p, self.file(st[-1])))
+        return out
 
     def targets(self, args, default='/'):
         """コマンド引数 (パス or -i 指定時はファイルID) を [(表示名, BFile)] に."""
@@ -560,10 +566,15 @@ def fmt_time_s(t):
     return fmt_time(t)
 
 
-def attr_str(f):
+V_HIDDEN = 0x8000       # 仮身属性 (リンク属性データ1) の隠蔽仮身ビット (3.8.3.1 図123)
+
+
+def attr_str(f, link_attrs=None):
+    """CLI ls -l の ATR: H 隠蔽仮身 (リンク側の属性), P 削除不可, R 書込不可, 1/2 アプリ属性."""
+    h = 'H' if link_attrs and link_attrs[0] & V_HIDDEN else '-'
     a = f.attr
-    return ''.join(c if a & bit else '-' for c, bit in
-                   (('P', 0x20), ('R', 0x10), ('1', 0x40), ('2', 0x80)))
+    return h + ''.join(c if a & bit else '-' for c, bit in
+                       (('P', 0x20), ('R', 0x10), ('1', 0x40), ('2', 0x80)))
 
 
 def cmd_df(d, args):
@@ -577,18 +588,18 @@ def cmd_df(d, args):
 def cmd_ls(d, args):
     r = Resolver(d)
     if args.long:
-        print('ATYPE ATR  NREC  NLNK  NREF       SIZE    BLK  MTIME                NAME')
+        print('ATYPE ATR   NREC  NLNK  NREF       SIZE    BLK  MTIME                NAME')
     elif args.time:
         print('CTIME                ATIME                MTIME                NAME')
     targets = r.targets(args)
     for tpath, tf in targets:
         if args.self_:
-            entries = [(tpath, tf.fid)]
+            entries = [(tpath, tf.fid, r.link_attrs.get(tpath))]
         else:
-            entries = [(disp, fid) for disp, _, _, fid in r.children(tf)]
+            entries = [(disp, fid, attrs) for disp, _, _, fid, attrs in r.children(tf)]
             if len(targets) > 1:
                 print('%s:' % tpath)
-        for disp, fid in entries:
+        for disp, fid, lattrs in entries:
             try:
                 f = r.file(fid)
             except FormatError as e:
@@ -602,7 +613,7 @@ def cmd_ls(d, args):
                     name += '#'
             if args.long:
                 print('%04x  %s %5d %5d %5d %10d %6d  %s  %s' % (
-                    f.apptype, attr_str(f), f.nrec, f.nlink, f.refcount, f.size, f.nblk,
+                    f.apptype, attr_str(f, lattrs), f.nrec, f.nlink, f.refcount, f.size, f.nblk,
                     fmt_time_s(f.t_upd), name))
             elif args.time:
                 print('%s  %s  %s  %s' % (fmt_time_s(f.t_gen), fmt_time_s(f.t_acc),
