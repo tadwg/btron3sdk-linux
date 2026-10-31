@@ -17,13 +17,21 @@
     ファイルヘッダ +176 にレコードインデックス開始位置 (ridxofs) があり、
     フラグメントテーブルは 8 バイト (size, offset, blk) × 可変個
 
-使い方:
-  bfsk.py [-p N] IMAGE info
-  bfsk.py [-p N] IMAGE records FILEID
+使い方 (詳細は README.md):
+  bfsk.py [-p N | -n FSNAME] IMAGE COMMAND ...
+    info                         イメージ / ファイルシステムの詳細
+    df                           ディスク状態
+    ls [-f][-F][-l|-t] [PATH..]  ファイル一覧
+    fs [-l] [PATH..]             レコード構成
+    stat [PATH..]                ファイルヘッダの詳細
+    tp [-r#][-a|-x|-b][-e] PATH  レコード内容 (既定は生データを標準出力へ)
+  PATH の各コマンドで -i を付けると PATH の代わりにファイルID を指定できる.
 """
 import argparse
+import fnmatch
 import struct
 import sys
+import unicodedata
 
 # ブート領域の大きさ (= パーティション先頭からシステムブロックまで) の候補.
 # 付録B: 準標準 2HD は 2048, 実 HD イメージは 4096. 論理ブロック1 はブート領域の直後.
@@ -57,6 +65,15 @@ def fmt_time(t):
     if t in (0, 0xFFFFFFFF):
         return '-' if t == 0 else 'none'
     return datetime.datetime.fromtimestamp(t + EPOCH_1985, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def norm_name(name):
+    """名前比較用の正規化: CLI と同様に全角/半角を区別しない."""
+    return unicodedata.normalize('NFKC', name).translate(_NAME_FOLD)
+
+
+# NFKC で半角にならない記号 (TRON コード→EUC-JP 変換で出るもの) を補う
+_NAME_FOLD = str.maketrans({'\u2212': '-', '\u301c': '~', '\uff5e': '~', '\u2015': '-', '\u2010': '-'})
 
 
 class FormatError(Exception):
@@ -191,9 +208,19 @@ def open_image(path):
 
 
 class Disk:
-    def __init__(self, path, part=None):
+    def __init__(self, path, part=None, fsname=None):
         self.img = open_image(path)
-        self.base = self._find_partition(part)
+        found = self._find_partitions(part)
+        if not found:
+            raise FormatError('BTRON ファイルシステムが見つかりません')
+        for self.base, self.boot_size in found:
+            self._load_header()
+            if fsname is None or norm_name(self.fsname) == norm_name(fsname):
+                break
+        else:
+            raise FormatError('ファイルシステム "%s" が見つかりません' % fsname)
+
+    def _load_header(self):
         h = self._read(self.base + self.boot_size, 128)
         (self.disk_id, self.fmt_id, self.ssys, self.sfidt, self.sfnmt,
          self.nbmp) = struct.unpack_from('<6H', h, 0)
@@ -224,31 +251,32 @@ class Disk:
                 raise FormatError('TRON 標準形式 (ビッグエンディアン) には未対応です')
         return None
 
-    def _find_partition(self, part):
+    def _find_partitions(self, part):
+        """BTRON ファイルシステムを持つ (パーティション先頭, ブート領域長) の一覧."""
         mbr = self._read(0, 512)
         cands = []
         if mbr[510:512] == b'\x55\xaa':
             for i in range(4):
                 e = mbr[0x1BE + 16 * i:0x1CE + 16 * i]
-                ptype = e[4]
                 lba = struct.unpack_from('<I', e, 8)[0]
-                if ptype and lba:
-                    cands.append((i + 1, ptype, lba * 512))
+                if e[4] and lba:
+                    cands.append((i + 1, lba * 512))
         if part is not None:
-            for no, _, off in cands:
-                if no == part:
-                    bs = self._probe(off)
-                    if bs is None:
-                        raise FormatError('パーティション %d に BTRON ファイルシステムがありません' % part)
-                    self.boot_size = bs
-                    return off
-            raise FormatError('パーティション %d がありません' % part)
-        for off in [c[2] for c in cands] + [0]:     # 0: パーティション単体 / フロッピー
+            offs = [off for no, off in cands if no == part]
+            if not offs:
+                raise FormatError('パーティション %d がありません' % part)
+        else:
+            offs = [off for _, off in cands] + [0]     # 0: パーティション単体 / フロッピー
+        out = []
+        for off in offs:
             bs = self._probe(off)
             if bs is not None:
-                self.boot_size = bs
-                return off
-        raise FormatError('BTRON ファイルシステムが見つかりません')
+                out.append((off, bs))
+                if off == 0:
+                    break
+        if part is not None and not out:
+            raise FormatError('パーティション %d に BTRON ファイルシステムがありません' % part)
+        return out
 
     def block_offset(self, n):
         if n == 0:
@@ -338,8 +366,37 @@ class BFile:
             else:
                 yield from self._walk_indirect(child, 0, level - 1)
 
+    def read_record(self, rec):
+        """データレコードの内容を返す. 複数ブロックにまたがる場合は連結する (4.3.7 図72)."""
+        out = bytearray()
+        remain = rec['size']
+        start = rec['offset']
+        for blk, cnt in rec['extents']:
+            if remain <= 0:
+                break
+            n = min(remain, cnt * self.disk.blksz - start)
+            out += self.disk._read(self.disk.block_offset(blk) + start, n)
+            remain -= n
+            start = 0
+        if remain > 0:
+            raise FormatError('レコードの割り当てブロックが不足しています')
+        return bytes(out)
+
+    @property
+    def refcount(self):
+        if self.ref == 255:              # 拡張形式: 255 以上はヘッダに実数
+            rc = struct.unpack_from('<I', self.hblock, 172)[0]
+            return rc or 255
+        return self.ref
+
+    def links(self):
+        """リンクレコードのみ: [(レコード番号, リンク先 fid)]."""
+        return [(i, r['link_fid']) for i, r in enumerate(self.records()) if r['kind'] == 'link']
+
     def records(self):
         """レコードの一覧を返す (dict のリスト)."""
+        if getattr(self, '_recs', None) is not None:
+            return self._recs
         recs = []
         for e in self._index_entries():
             b0, b1 = e[0], e[1]
@@ -364,6 +421,7 @@ class BFile:
                 recs.append({'kind': 'data', 'type': b1 & 0x1F, 'subtype': subtype,
                              'offset': start, 'size': size, 'extents': ext})
             # b0 == b1 == 0: 未使用インデックス
+        self._recs = recs
         return recs
 
 
@@ -380,53 +438,311 @@ def cmd_info(d, args):
     print('created / updated: %s / %s' % (fmt_time(d.t_gen), fmt_time(d.t_upd)))
 
 
-def cmd_records(d, args):
-    f = d.open_file(args.fileid)
-    recs = f.records()
-    print('file id   : %d (header block %d, ref %d)' % (f.fid, f.blk, f.ref))
-    print('name      : %s' % f.name)
-    print('type/attr : %d / 0x%03x   apptype 0x%04x' % (f.ftype, f.attr, f.apptype))
-    print('level     : %d   records %d   links %d   bytes %d   blocks %d'
-          % (f.level, f.nrec, f.nlink, f.size, f.nblk))
-    print('created   : %s   updated %s' % (fmt_time(f.t_gen), fmt_time(f.t_upd)))
-    print('index ofs : %d   fragments: %s' % (f.ridxofs, ' '.join(
-        '%d@%d+%d' % fr for fr in f.fragments()) or '-'))
-    if f.hdr_fid != f.fid:
-        print('warning: ヘッダ内ファイルID %d が一致しません' % f.hdr_fid, file=sys.stderr)
-    print()
-    print('%4s %-4s %4s %7s %10s %6s  %s' % ('no', 'kind', 'type', 'subtype', 'size', 'offset', 'blocks / link'))
-    for i, r in enumerate(recs):
-        if r['kind'] == 'link':
-            try:
-                tgt = d.open_file(r['link_fid']).name
-            except FormatError:
-                tgt = '?'
-            extra = '-> fid %d %s  attr=%s' % (r['link_fid'], tgt, ','.join('%04x' % a for a in r['attrs']))
-            print('%4d %-4s %4d %#7x %10s %6s  %s' % (i, 'link', 0, r['subtype'], '-', '-', extra))
+# ---------------------------------------------------------------------------
+# パス解決
+#   /A/B/C     ルートからリンクをたどる (相対パスもルート起点. "." と ".." 可)
+#   名前:N     同じ名前の N 番目 (0 起点, ":0" は省略形と同じ)
+#   %c         次の 1 文字をそのまま扱う (%*, %:, %/, %% など)
+#   *          ワイルドカード
+#   全角/半角は区別しない
+# ---------------------------------------------------------------------------
+def split_path(path):
+    comps, cur, esc = [], [], False
+    for ch in path:
+        if esc:
+            cur.append(('lit', ch))
+            esc = False
+        elif ch == '%':
+            esc = True
+        elif ch == '/':
+            comps.append(cur)
+            cur = []
         else:
-            ext = ' '.join('%d+%d' % (a, c) if c > 1 else '%d' % a for a, c in r['extents']) or '-'
-            print('%4d %-4s %4d %#7x %10d %6d  %s' % (i, 'data', r['type'], r['subtype'],
-                                                     r['size'], r['offset'], ext))
-    if len(recs) != f.nrec:
-        print('warning: ヘッダの総レコード数 %d と一覧の件数 %d が一致しません' % (f.nrec, len(recs)),
-              file=sys.stderr)
+            cur.append(('lit' if ch not in '*:' else ch, ch))
+    comps.append(cur)
+    return [c for c in comps if c]
+
+
+def parse_comp(toks):
+    """トークン列を (fnmatch パターン, ワイルドカード有無, 出現番号 or None) に."""
+    occ = None
+    if ':' in [t for t, _ in toks]:
+        i = max(k for k, (t, _) in enumerate(toks) if t == ':')
+        num = ''.join(ch for _, ch in toks[i + 1:])
+        if num.isdigit() and all(t == 'lit' for t, _ in toks[i + 1:]):
+            occ = int(num)
+            toks = toks[:i]
+    pat, wild = [], False
+    for t, ch in toks:
+        if t == '*':
+            pat.append('*')
+            wild = True
+        else:   # 正規化してから fnmatch の特殊文字をエスケープ (例: "［" → "[" → "[[]")
+            pat.append(''.join('[%s]' % c if c in '[]?*' else c for c in norm_name(ch)))
+    return ''.join(pat), wild, occ
+
+
+class Resolver:
+    def __init__(self, disk):
+        self.d = disk
+        self._cache = {}
+
+    def file(self, fid):
+        f = self._cache.get(fid)
+        if f is None:
+            f = self._cache[fid] = self.d.open_file(fid)
+        return f
+
+    def children(self, f):
+        """(表示名, fid) の列. 同名 2 つ目以降は "名前:N"."""
+        seen = {}
+        out = []
+        for _, fid in f.links():
+            try:
+                name = self.file(fid).name
+            except FormatError:
+                name = '?'
+            key = norm_name(name)
+            n = seen.get(key, 0)
+            seen[key] = n + 1
+            out.append((name if n == 0 else '%s:%d' % (name, n), name, n, fid))
+        return out
+
+    def resolve(self, path):
+        """パスに一致する [(表示パス, BFile)] を返す (ワイルドカードで複数あり得る)."""
+        results = [([], [0])]           # (表示名リスト, fid スタック)
+        for toks in split_path(path):
+            word = ''.join(ch for _, ch in toks)
+            nxt = []
+            for names, stack in results:
+                if word == '.' and all(t == 'lit' for t, _ in toks):
+                    nxt.append((names, stack))
+                    continue
+                if word == '..' and all(t == 'lit' for t, _ in toks):
+                    nxt.append((names[:-1], stack[:-1] or [0]))
+                    continue
+                pat, wild, occ = parse_comp(toks)
+                for disp, name, n, fid in self.children(self.file(stack[-1])):
+                    if not fnmatch.fnmatchcase(norm_name(name), pat):
+                        continue
+                    if occ is not None and n != occ:
+                        continue
+                    if occ is None and not wild and n != 0:
+                        continue
+                    nxt.append((names + [disp], stack + [fid]))
+            results = nxt
+        if not results:
+            raise FormatError('%s: ファイルが見つかりません' % path)
+        return [('/' + '/'.join(n), self.file(st[-1])) for n, st in results]
+
+    def targets(self, args, default='/'):
+        """コマンド引数 (パス or -i 指定時はファイルID) を [(表示名, BFile)] に."""
+        items = args.paths if getattr(args, 'paths', None) else [default]
+        out = []
+        for a in items:
+            if args.fid:
+                try:
+                    fid = int(a, 0)
+                except ValueError:
+                    raise FormatError('%s: ファイルID は数値で指定してください' % a)
+                out.append(('#%d' % fid, self.file(fid)))
+            else:
+                out.extend(self.resolve(a))
+        return out
+
+
+# ---------------------------------------------------------------------------
+# コマンド (超漢字V CLI に準拠した出力)
+# ---------------------------------------------------------------------------
+def fmt_time_s(t):
+    if t in (0, 0xFFFFFFFF):
+        return '-'.ljust(19)
+    return fmt_time(t)
+
+
+def attr_str(f):
+    a = f.attr
+    return ''.join(c if a & bit else '-' for c, bit in
+                   (('P', 0x20), ('R', 0x10), ('1', 0x40), ('2', 0x80)))
+
+
+def cmd_df(d, args):
+    total = d.nlb * d.blksz // 1024
+    free = d.nfree * d.blksz // 1024
+    used = (100 * (d.nlb - d.nfree) // d.nlb) if d.nlb else 0
+    print('%12s %12s %4s %6s %7s  %s' % ('TOTAL', 'FREE', 'USED', 'UNIT', 'MAXFILE', 'NAME'))
+    print('%12d %12d %3d%% %6d %7d  %s' % (total, free, used, d.blksz, d.nfmax, d.fsname))
+
+
+def cmd_ls(d, args):
+    r = Resolver(d)
+    if args.long:
+        print('ATYPE ATR  NREC  NLNK  NREF       SIZE    BLK  MTIME                NAME')
+    elif args.time:
+        print('CTIME                ATIME                MTIME                NAME')
+    targets = r.targets(args)
+    for tpath, tf in targets:
+        if args.self_:
+            entries = [(tpath, tf.fid)]
+        else:
+            entries = [(disp, fid) for disp, _, _, fid in r.children(tf)]
+            if len(targets) > 1:
+                print('%s:' % tpath)
+        for disp, fid in entries:
+            try:
+                f = r.file(fid)
+            except FormatError as e:
+                print('%s  (%s)' % (disp, e))
+                continue
+            name = disp
+            if args.classify:
+                if f.nlink:
+                    name += '/'
+                if f.refcount > 1:
+                    name += '#'
+            if args.long:
+                print('%04x  %s %5d %5d %5d %10d %6d  %s  %s' % (
+                    f.apptype, attr_str(f), f.nrec, f.nlink, f.refcount, f.size, f.nblk,
+                    fmt_time_s(f.t_upd), name))
+            elif args.time:
+                print('%s  %s  %s  %s' % (fmt_time_s(f.t_gen), fmt_time_s(f.t_acc),
+                                          fmt_time_s(f.t_upd), name))
+            else:
+                print(name)
+
+
+def cmd_fs(d, args):
+    r = Resolver(d)
+    targets = r.targets(args)
+    for tpath, f in targets:
+        if len(targets) > 1:
+            print('%s:' % tpath)
+        recs = f.records()
+        for i, rec in enumerate(recs):
+            if rec['kind'] == 'link':
+                try:
+                    name = r.file(rec['link_fid']).name
+                except FormatError:
+                    name = '*?'
+                if args.long:
+                    print('%3d: 0 %04x : %5d [%s] : %s' % (
+                        i, rec['subtype'], rec['link_fid'],
+                        ' '.join('%04x' % a for a in rec['attrs']), name))
+                else:
+                    print('%3d: 0 %04x : %s' % (i, rec['subtype'], name))
+            else:
+                line = '%3d: %2d %04x : %d' % (i, rec['type'], rec['subtype'], rec['size'])
+                if args.long:
+                    line += '  [blk %s ofs %d]' % (' '.join('%d+%d' % (a, c) if c > 1 else '%d' % a
+                                                           for a, c in rec['extents']) or '-', rec['offset'])
+                print(line)
+        if len(recs) != f.nrec:
+            print('warning: ヘッダの総レコード数 %d と一覧の件数 %d が一致しません'
+                  % (f.nrec, len(recs)), file=sys.stderr)
+
+
+def cmd_stat(d, args):
+    r = Resolver(d)
+    for tpath, f in r.targets(args):
+        print('path      : %s' % tpath)
+        print('file id   : %d (header block %d, ref %d)' % (f.fid, f.blk, f.refcount))
+        print('name      : %s' % f.name)
+        print('type/attr : %d / 0x%03x   apptype 0x%04x' % (f.ftype, f.attr, f.apptype))
+        print('level     : %d   records %d   links %d   bytes %d   blocks %d'
+              % (f.level, f.nrec, f.nlink, f.size, f.nblk))
+        print('created   : %s' % fmt_time(f.t_gen))
+        print('accessed  : %s' % fmt_time(f.t_acc))
+        print('updated   : %s' % fmt_time(f.t_upd))
+        print('index ofs : %d' % f.ridxofs)
+        print('fragments : %s' % (' '.join('%d@%d+%d' % fr for fr in f.fragments()) or '-'))
+        if f.hdr_fid != f.fid:
+            print('warning: ヘッダ内ファイルID %d が一致しません' % f.hdr_fid, file=sys.stderr)
+
+
+def hexdump(data, half, out):
+    for off in range(0, len(data), 16):
+        chunk = data[off:off + 16]
+        if half:
+            cells = ' '.join('%04x' % struct.unpack_from('<H', chunk.ljust(len(chunk) + len(chunk) % 2, b'\0'), k)[0]
+                             for k in range(0, len(chunk), 2))
+            width = 39
+        else:
+            cells = ' '.join('%02x' % b for b in chunk)
+            width = 47
+        txt = ''.join(chr(b) if 0x20 <= b < 0x7F else '.' for b in chunk)
+        out.write('%08x  %-*s  %s\n' % (off, width, cells, txt))
+
+
+def cmd_tp(d, args):
+    r = Resolver(d)
+    targets = r.targets(args)
+    if len(targets) != 1:
+        raise FormatError('tp: ファイルを 1 つだけ指定してください (%d 件一致)' % len(targets))
+    f = targets[0][1]
+    recs = f.records()
+    if not 0 <= args.record < len(recs):
+        raise FormatError('tp: レコード番号 %d は範囲外です (0..%d)' % (args.record, len(recs) - 1))
+    rec = recs[args.record]
+    if rec['kind'] == 'link':
+        raise FormatError('tp: レコード %d はリンクレコードです' % args.record)
+    data = f.read_record(rec)
+    if args.endian:
+        b = bytearray(data)
+        b[0:len(b) & ~1:2], b[1:len(b) & ~1:2] = b[1:len(b) & ~1:2], b[0:len(b) & ~1:2]
+        data = bytes(b)
+    out = sys.stdout
+    if args.mode == 'x' or args.mode == 'b':
+        hexdump(data, args.mode == 'x', out)
+    elif args.mode == 'a':
+        out.write(data.decode('euc-jp', 'replace'))
+    else:
+        if sys.stdout.isatty():
+            raise FormatError('tp: 端末へは生データを出力しません. '
+                              'リダイレクトするか -a / -x / -b を指定してください')
+        sys.stdout.buffer.write(data)
 
 
 def main():
     ap = argparse.ArgumentParser(prog='bfsk', description='BTRON ディスクイメージ操作ツール')
-    ap.add_argument('-p', '--partition', type=int, help='MBR パーティション番号 (1-4, 省略時は自動検出)')
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument('-p', '--partition', type=int, help='MBR パーティション番号 (1-4, 省略時は自動検出)')
+    g.add_argument('-n', '--fsname', help='ファイルシステム名で選択 (例: "B-right/V")')
     ap.add_argument('image')
-    sub = ap.add_subparsers(dest='cmd', required=True)
-    sub.add_parser('info', help='ファイルシステム情報を表示')
-    p = sub.add_parser('records', help='ファイルのレコード一覧を表示')
-    p.add_argument('fileid', type=int)
+    sub = ap.add_subparsers(dest='cmd', required=True, metavar='COMMAND')
+
+    def path_cmd(name, help_, nargs='*'):
+        p = sub.add_parser(name, help=help_)
+        p.add_argument('-i', '--fid', action='store_true', help='PATH の代わりにファイルID で指定')
+        p.add_argument('paths', nargs=nargs, metavar='PATH')
+        return p
+
+    sub.add_parser('info', help='イメージ / ファイルシステムの詳細')
+    sub.add_parser('df', help='ディスク状態を表示')
+    p = path_cmd('ls', 'ファイル一覧')
+    p.add_argument('-f', dest='self_', action='store_true', help='PATH のファイル自体の情報を表示')
+    p.add_argument('-F', dest='classify', action='store_true', help='リンクを含むと "/", 多重参照は "#" を付加')
+    m = p.add_mutually_exclusive_group()
+    m.add_argument('-l', dest='long', action='store_true', help='詳細情報')
+    m.add_argument('-t', dest='time', action='store_true', help='日時情報')
+    p = path_cmd('fs', 'レコード構成')
+    p.add_argument('-l', dest='long', action='store_true', help='詳細表示')
+    path_cmd('stat', 'ファイルヘッダの詳細')
+    p = path_cmd('tp', 'レコード内容 (既定は生データを標準出力へ)', nargs=1)
+    p.add_argument('-r', dest='record', type=lambda x: int(x, 0), default=0, help='レコード番号 (既定 0)')
+    p.add_argument('-e', dest='endian', action='store_true', help='エンディアン変換 (2 バイト単位で入れ替え)')
+    m = p.add_mutually_exclusive_group()
+    m.add_argument('-a', dest='mode', action='store_const', const='a', help='EUC 文字列として表示')
+    m.add_argument('-x', dest='mode', action='store_const', const='x', help='16 進ダンプ (ハーフワード)')
+    m.add_argument('-b', dest='mode', action='store_const', const='b', help='16 進ダンプ (バイト)')
     args = ap.parse_args()
     try:
-        d = Disk(args.image, args.partition)
-        {'info': cmd_info, 'records': cmd_records}[args.cmd](d, args)
+        d = Disk(args.image, args.partition, args.fsname)
+        {'info': cmd_info, 'df': cmd_df, 'ls': cmd_ls, 'fs': cmd_fs, 'stat': cmd_stat, 'tp': cmd_tp}[args.cmd](d, args)
     except FormatError as e:
         print('error: %s' % e, file=sys.stderr)
         return 1
+    except BrokenPipeError:
+        return 0
     return 0
 
 
