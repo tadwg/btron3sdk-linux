@@ -10,8 +10,9 @@
   - ディスク全体イメージ (MBR, パーティションタイプ 0x13) またはパーティション単体
   - 全フィールドがリトルエンディアン (仕様書 4章のフロッピー形式はビッグエンディアン)
   - 論理ブロック長はシステムヘッダから取得 (実例: 32768)
-  - ブロック n のオフセット = パーティション先頭 + 0x1000 + (n-1) * ブロック長
-    (ブロック0 = BOOT 領域のみ 4KB)
+  - 準標準形式 (付録A: リトルエンディアン) のみ対応. 標準形式 (ビッグエンディアン) は非対応
+  - ブロック n のオフセット = パーティション先頭 + ブート領域長 + (n-1) * ブロック長
+    (付録B: 論理ブロック1 はブート領域の直後. ブート領域長は自動検出, 実例は 4096)
   - ディスク形式ID 0x6402 は「拡張形式2」(超漢字V R4 仕様差分, 4GB超対応):
     ファイルヘッダ +176 にレコードインデックス開始位置 (ridxofs) があり、
     フラグメントテーブルは 8 バイト (size, offset, blk) × 可変個
@@ -24,7 +25,10 @@ import argparse
 import struct
 import sys
 
-SYS_OFFSET = 0x1000          # パーティション先頭からシステムブロックまで
+# ブート領域の大きさ (= パーティション先頭からシステムブロックまで) の候補.
+# 付録B: 準標準 2HD は 2048, 実 HD イメージは 4096. 論理ブロック1 はブート領域の直後.
+BOOT_SIZES = (0x400, 0x800, 0x1000, 0x2000, 0x4000, 0x8000)
+DISK_FMT_IDS = (0x6400, 0x6401, 0x6402)
 FH_START = 0x54726F6E
 FH_END = 0x82DDE96B
 TRON_DISK_IDS = (0x42FE, 0x52FE)
@@ -190,7 +194,7 @@ class Disk:
     def __init__(self, path, part=None):
         self.img = open_image(path)
         self.base = self._find_partition(part)
-        h = self._read(self.base + SYS_OFFSET, 128)
+        h = self._read(self.base + self.boot_size, 128)
         (self.disk_id, self.fmt_id, self.ssys, self.sfidt, self.sfnmt,
          self.nbmp) = struct.unpack_from('<6H', h, 0)
         if self.disk_id not in TRON_DISK_IDS:
@@ -206,6 +210,20 @@ class Disk:
     def _read(self, off, n):
         return self.img.read(off, n)
 
+    def _probe(self, off):
+        """off をパーティション先頭とみなし、ブート領域の大きさを返す (見つからなければ None).
+        準標準形式 (リトルエンディアン) のシステムヘッダ: ディスクID, 形式ID, ..., 論理ブロック長."""
+        for bs in BOOT_SIZES:
+            h = self._read(off + bs, 28)
+            did, fid = struct.unpack_from('<2H', h, 0)
+            blksz = struct.unpack_from('<H', h, 24)[0]
+            if did in TRON_DISK_IDS and fid in DISK_FMT_IDS and blksz and blksz % 512 == 0:
+                return bs
+            bid, bfid = struct.unpack_from('>2H', h, 0)
+            if bid in TRON_DISK_IDS and bfid in DISK_FMT_IDS:
+                raise FormatError('TRON 標準形式 (ビッグエンディアン) には未対応です')
+        return None
+
     def _find_partition(self, part):
         mbr = self._read(0, 512)
         cands = []
@@ -219,19 +237,23 @@ class Disk:
         if part is not None:
             for no, _, off in cands:
                 if no == part:
+                    bs = self._probe(off)
+                    if bs is None:
+                        raise FormatError('パーティション %d に BTRON ファイルシステムがありません' % part)
+                    self.boot_size = bs
                     return off
             raise FormatError('パーティション %d がありません' % part)
-        for _, _, off in cands:
-            if struct.unpack('<H', self._read(off + SYS_OFFSET, 2))[0] in TRON_DISK_IDS:
+        for off in [c[2] for c in cands] + [0]:     # 0: パーティション単体 / フロッピー
+            bs = self._probe(off)
+            if bs is not None:
+                self.boot_size = bs
                 return off
-        if struct.unpack('<H', self._read(SYS_OFFSET, 2))[0] in TRON_DISK_IDS:
-            return 0                     # パーティション単体イメージ
         raise FormatError('BTRON ファイルシステムが見つかりません')
 
     def block_offset(self, n):
         if n == 0:
             return self.base
-        return self.base + SYS_OFFSET + (n - 1) * self.blksz
+        return self.base + self.boot_size + (n - 1) * self.blksz
 
     def read_block(self, n):
         return self._read(self.block_offset(n), self.blksz)
@@ -348,6 +370,7 @@ class BFile:
 def cmd_info(d, args):
     print('image format     : %s' % d.img.kind)
     print('partition offset : 0x%x' % d.base)
+    print('boot area size   : %d' % d.boot_size)
     print('disk id / format : 0x%04x / 0x%04x' % (d.disk_id, d.fmt_id))
     print('block size       : %d' % d.blksz)
     print('blocks total/free: %d / %d' % (d.nlb, d.nfree))
