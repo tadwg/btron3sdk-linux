@@ -24,6 +24,7 @@
     ls [-f][-F][-l|-t] [PATH..]  ファイル一覧
     fs [-l] [PATH..]             レコード構成
     stat [PATH..]                ファイルヘッダの詳細
+    check [-v]                   整合性チェック (fsck 相当, 読み取りのみ)
   書き込み (ファイルヘッダのみ変更):
     ren PATH NAME                ファイル名の変更
     chmod [-o#][-g#][-p#][-a#] PATH..   アクセスモード / 属性
@@ -478,6 +479,38 @@ class BFile:
             else:
                 yield from self._walk_indirect(child, 0, level - 1)
 
+    def index_blocks(self):
+        """インデックスブロック / 間接ブロックの番号一覧 (インデックスレベル > 0 のとき)."""
+        out = []
+
+        def walk(block, start, level):
+            for off in range(start, len(block) - 7, 8):
+                cnt, addr = struct.unpack_from('<2I', block, off)
+                if addr == 0:
+                    continue
+                out.append(addr)
+                if level > 1:
+                    walk(self.disk.read_block(addr), 0, level - 1)
+        if self.level > 0:
+            walk(self.hblock, self.ridxofs, self.level)
+        return out
+
+    def record_pieces(self, rec):
+        """データレコードがブロック内に占める範囲: [(ブロック, 開始, 終了)]."""
+        out = []
+        remain, start = rec['size'], rec['offset']
+        bs = self.disk.blksz
+        for blk, cnt in rec['extents']:
+            for k in range(cnt):
+                if remain <= 0:
+                    out.append((blk + k, 0, 0))      # 割り当てのみ (データなし)
+                    continue
+                n = min(remain, bs - start)
+                out.append((blk + k, start, start + n))
+                remain -= n
+                start = 0
+        return out, remain
+
     def read_record(self, rec):
         """データレコードの内容を返す. 複数ブロックにまたがる場合は連結する (4.3.7 図72)."""
         out = bytearray()
@@ -787,6 +820,213 @@ def cmd_stat(d, args):
 
 
 # ---------------------------------------------------------------------------
+# 整合性チェック (読み取りのみ)
+# ---------------------------------------------------------------------------
+class Checker:
+    def __init__(self, d, verbose=False):
+        self.d = d
+        self.verbose = verbose
+        self.errors = []
+        self.warnings = []
+
+    def err(self, msg):
+        self.errors.append(msg)
+
+    def warn(self, msg):
+        self.warnings.append(msg)
+
+    def bitmap(self, which):
+        d = self.d
+        nbytes = d.nbmp * (4 if d.fmt_id != 0x6400 else 1)
+        return d._read(d.block_offset(1) + 128 + which * nbytes, nbytes)
+
+    def run(self):
+        d = self.d
+        bs = d.blksz
+        # --- システムヘッダ
+        if bs & (bs - 1) or bs < 512:
+            self.err('論理ブロック長 %d が 2 のべき乗でない' % bs)
+        nbits = d.nbmp * (32 if d.fmt_id != 0x6400 else 8)
+        if nbits < d.nlb:
+            self.err('ビットマップ (%d ビット) が論理ブロック数 %d より小さい' % (nbits, d.nlb))
+        used_bm = self.bitmap(0)
+        bad_bm = self.bitmap(1)
+
+        def bit(bm, n):                       # 付録A: 各バイトの最下位ビットが先
+            return bm[n >> 3] >> (n & 7) & 1
+
+        full = d.nlb >> 3
+        nset = sum(bin(x).count('1') for x in used_bm[:full]) + \
+            sum(bit(used_bm, n) for n in range(full * 8, d.nlb))
+        zeros = d.nlb - nset
+        if zeros != d.nfree:
+            self.err('空き論理ブロック数 %d がビットマップの未使用数 %d と一致しない' % (d.nfree, zeros))
+        # --- ファイル ID テーブル / 各ファイル
+        owner = {}                            # ブロック → 所有者 (fid or 'system')
+        for n in range(1 + d.ssys + d.sfidt + d.sfnmt):
+            owner[n] = 'system'
+        fidt = d._read(d.block_offset(d.fidt_blk), d.nfmax * 4)
+        fnmt = d._read(d.block_offset(d.fnmt_blk), d.nfmax * 4)
+        files = {}
+        links_to = {}
+        for fid in range(d.nfmax):
+            v = struct.unpack_from('<I', fidt, fid * 4)[0]
+            if v == 0:
+                continue
+            blk, ref = v & 0xFFFFFF, v >> 24
+            if not 0 < blk < d.nlb:
+                self.err('fid %d: 開始ブロック %d が範囲外' % (fid, blk))
+                continue
+            try:
+                f = BFile(d, fid, blk, ref)
+            except FormatError as e:
+                self.err('fid %d: %s' % (fid, e))
+                continue
+            files[fid] = f
+            self.check_file(f, fnmt, owner, links_to)
+        # --- 参照カウント
+        for fid, f in files.items():
+            n = links_to.get(fid, 0)
+            if f.refcount != n:
+                self.err('fid %d %s: 参照カウント %d と実際の固定リンク数 %d が一致しない' % (fid, f.name, f.refcount, n))
+        for fid in links_to:
+            if fid not in files:
+                self.err('fid %d: 存在しないファイルへのリンクがある (%d 個)' % (fid, links_to[fid]))
+        # --- ルートからの到達性
+        if 0 not in files:
+            self.err('ルートファイル (fid 0) がない')
+        else:
+            seen, stack = {0}, [0]
+            while stack:
+                for _, c, _ in files[stack.pop()].links():
+                    if c in files and c not in seen:
+                        seen.add(c)
+                        stack.append(c)
+            for fid in sorted(set(files) - seen):
+                self.warn('fid %d %s: ルートから到達できない (参照カウント %d)' % (fid, files[fid].name, files[fid].refcount))
+        # --- ビットマップと実際の使用ブロック
+        for n in range(d.nlb):
+            u = bit(used_bm, n)
+            if bit(bad_bm, n):
+                if not u:
+                    self.err('ブロック %d: 不良ブロックが使用ブロックビットマップで未使用になっている' % n)
+                continue
+            if u and n not in owner:
+                self.warn('ブロック %d: 使用中だがどのファイルにも属さない' % n)
+            elif not u and n in owner:
+                self.err('ブロック %d: %s が使用しているがビットマップでは未使用' % (n, owner[n]))
+        self.nfiles = len(files)
+        self.nblocks = len(owner)
+
+    def claim(self, owner, blk, who, what):
+        if not 0 < blk < self.d.nlb:
+            self.err('%s: %s のブロック %d が範囲外' % (who, what, blk))
+            return False
+        prev = owner.get(blk)
+        if prev is not None and prev != who:
+            self.err('ブロック %d: %s と %s の両方が使用している' % (blk, prev, who))
+            return False
+        owner[blk] = who
+        return True
+
+    def check_file(self, f, fnmt, owner, links_to):
+        d = self.d
+        who = 'fid %d' % f.fid
+        if f.hdr_fid != f.fid:
+            self.err('%s: ヘッダ内のファイル ID %d が一致しない' % (who, f.hdr_fid))
+        sn = struct.unpack_from('<I', fnmt, f.fid * 4)[0]
+        if sn != short_name(bytes(f.hblock[108:148])):
+            self.err('%s %s: 短縮名テーブルの値が一致しない' % (who, f.name))
+        if f.ftype == 0:
+            self.warn('%s: リンクファイル (未対応のため内容は検査しない)' % who)
+            self.claim(owner, f.blk, who, 'ヘッダ')
+            return
+        blocks = {f.blk}
+        self.claim(owner, f.blk, who, 'ヘッダ')
+        for b in f.index_blocks():
+            blocks.add(b)
+            self.claim(owner, b, who, 'インデックス')
+        try:
+            recs = f.records()
+        except FormatError as e:
+            self.err('%s: %s' % (who, e))
+            return
+        size = nlink = 0
+        pieces = {}
+        for i, r in enumerate(recs):
+            if r['kind'] == 'link':
+                nlink += 1
+                links_to[r['link_fid']] = links_to.get(r['link_fid'], 0) + 1
+                continue
+            size += r['size']
+            ps, remain = f.record_pieces(r)
+            if remain > 0:
+                self.err('%s: レコード %d の割り当てブロックが %d バイト不足' % (who, i, remain))
+            for blk, a, b in ps:
+                if blk not in blocks:
+                    blocks.add(blk)
+                    self.claim(owner, blk, who, 'データ')
+                if b > a:
+                    pieces.setdefault(blk, []).append((a, b, i))
+        if len(recs) != f.nrec:
+            self.err('%s: 総レコード数 %d と実際 %d が一致しない' % (who, f.nrec, len(recs)))
+        if nlink != f.nlink:
+            self.err('%s: リンク数 %d と実際 %d が一致しない' % (who, f.nlink, nlink))
+        if size != f.size:
+            self.err('%s: 総バイト数 %d と実際 %d が一致しない' % (who, f.size, size))
+        if len(blocks) != f.nblk:
+            self.err('%s: 総使用ブロック数 %d と実際 %d が一致しない' % (who, f.nblk, len(blocks)))
+        # --- 区切りコードと空き領域 (4.3.8)
+        free = set()
+        for blk, ps in pieces.items():
+            data = d.read_block(blk)
+            ps.sort()
+            pos = 0
+            for k, (a, b, i) in enumerate(ps):
+                if a < pos:
+                    self.err('%s: ブロック %d でレコードが重なっている (レコード %d)' % (who, blk, i))
+                gap = a - pos
+                if pos == 0 and gap:                     # 先頭の空き: [空き y][y][レコード]
+                    y = gap - 2
+                    if y < 0 or struct.unpack_from('<H', data, a - 2)[0] != y:
+                        self.err('%s: ブロック %d 先頭の区切りコード不正' % (who, blk))
+                    elif y:
+                        free.add((blk, 0, y))
+                elif pos:                                # レコード間: [x][空き x][x]
+                    x = gap - 4
+                    c1 = struct.unpack_from('<H', data, pos)[0] if gap >= 2 else None
+                    c2 = struct.unpack_from('<H', data, a - 2)[0] if gap >= 2 else None
+                    if x < 0 or c1 != x or c2 != x:
+                        self.err('%s: ブロック %d オフセット %d の区切りコード不正' % (who, blk, pos))
+                    elif x:
+                        free.add((blk, pos + 2, x))
+                pos = b
+            if 0 < pos < d.blksz:                        # 末尾の空き: [z][空き z]
+                z = d.blksz - pos - 2
+                if z < 0 or struct.unpack_from('<H', data, pos)[0] != z:
+                    self.err('%s: ブロック %d 末尾の区切りコード不正' % (who, blk))
+                elif z:
+                    free.add((blk, pos + 2, z))
+        for size_, blk, off in f.fragments():
+            if (blk, off, size_) not in free:
+                self.err('%s: フラグメント %d@%d+%d が実際の空き領域と一致しない' % (who, size_, blk, off))
+
+
+def cmd_check(d, args):
+    c = Checker(d, args.verbose)
+    c.run()
+    for m in c.errors:
+        print('ERROR: ' + m)
+    for m in c.warnings[:None if args.verbose else 50]:
+        print('WARN : ' + m)
+    if not args.verbose and len(c.warnings) > 50:
+        print('WARN : ... ほか %d 件 (-v で全件)' % (len(c.warnings) - 50))
+    print('files %d, blocks in use %d, errors %d, warnings %d' % (
+        c.nfiles, c.nblocks, len(c.errors), len(c.warnings)))
+    return 1 if c.errors else 0
+
+
+# ---------------------------------------------------------------------------
 # 書き込みコマンド (ファイルヘッダのみ変更)
 # ---------------------------------------------------------------------------
 H_TYPE, H_GRPACC, H_PUBACC, H_LTIME, H_ATIME, H_MTIME, H_NAME = 4, 64, 66, 92, 96, 100, 108
@@ -939,6 +1179,8 @@ def main():
     m.add_argument('-a', dest='mode', action='store_const', const='a', help='EUC 文字列として表示')
     m.add_argument('-x', dest='mode', action='store_const', const='x', help='16 進ダンプ (ハーフワード)')
     m.add_argument('-b', dest='mode', action='store_const', const='b', help='16 進ダンプ (バイト)')
+    p = sub.add_parser('check', help='整合性チェック (読み取りのみ)')
+    p.add_argument('-v', dest='verbose', action='store_true', help='警告を全件表示')
     p = sub.add_parser('ren', help='ファイル名の変更 (書き込み)')
     p.add_argument('-i', '--fid', action='store_true', help='PATH の代わりにファイルID で指定')
     p.add_argument('-v', dest='verbose', action='store_true', help='変更結果を表示')
@@ -963,8 +1205,10 @@ def main():
             getattr(args, k) is not None for k in ('ltime', 'atime', 'mtime')) else set())
     try:
         d = Disk(args.image, args.partition, args.fsname, writable=args.cmd in writes)
-        {'info': cmd_info, 'df': cmd_df, 'ls': cmd_ls, 'fs': cmd_fs, 'stat': cmd_stat, 'tp': cmd_tp,
+        rc = {'info': cmd_info, 'df': cmd_df, 'check': cmd_check, 'ls': cmd_ls, 'fs': cmd_fs, 'stat': cmd_stat, 'tp': cmd_tp,
          'ren': cmd_ren, 'chmod': cmd_chmod, 'chtime': cmd_chtime, 'touch': cmd_touch}[args.cmd](d, args)
+        if rc:
+            return rc
     except FormatError as e:
         print('error: %s' % e, file=sys.stderr)
         return 1
