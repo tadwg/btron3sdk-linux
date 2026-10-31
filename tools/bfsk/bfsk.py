@@ -738,7 +738,7 @@ class Resolver:
         for a in items:
             if args.fid:
                 try:
-                    fid = int(a, 0)
+                    fid = cli_int(a)
                 except ValueError:
                     raise FormatError('%s: ファイルID は数値で指定してください' % a)
                 out.append(('#%d' % fid, self.file(fid)))
@@ -1517,18 +1517,35 @@ def split_parent(path):
 
 def resolve_one(r, spec, by_fid, what):
     if by_fid:
-        return '#%s' % spec, r.file(int(spec, 0))
+        return '#%s' % spec, r.file(cli_int(spec))
     t = r.resolve(spec)
     if len(t) != 1:
         raise FormatError('%s: %s に %d 件一致しました (1 件だけ指定してください)' % (what, spec, len(t)))
     return t[0]
 
 
+def cli_int(text):
+    """CLI の数値形式 (4.1): NNNN 10進, 0NNN 8進, 0xNNNN 16進. 負号も可."""
+    t = text.strip()
+    neg = t.startswith('-')
+    body = t[1:] if neg else t
+    try:
+        if body[:2].lower() == '0x':
+            v = int(body[2:], 16)
+        elif len(body) > 1 and body[0] == '0':
+            v = int(body[1:], 8)
+        else:
+            v = int(body, 10)
+    except ValueError:
+        raise ValueError('数値の形式が不正です: %s' % text)
+    return -v if neg else v
+
+
 def parse_pair(spec, what, default2=None):
     parts = spec.split('.')
     try:
-        a = int(parts[0], 0)
-        b = int(parts[1], 0) if len(parts) > 1 and parts[1] != '' else default2
+        a = cli_int(parts[0])
+        b = cli_int(parts[1]) if len(parts) > 1 and parts[1] != '' else default2
     except ValueError:
         raise FormatError('%s の指定が不正です: %s' % (what, spec))
     return a, b
@@ -1570,7 +1587,7 @@ def _rm_targets(s, args):
     out = []
     for spec in args.paths:
         if args.fid:
-            out.append((None, int(spec, 0), None, '#' + spec))
+            out.append((None, cli_int(spec), None, '#' + spec))
             continue
         for p, f in s.r.resolve(spec):
             parent, recno = s.r.link_pos[p] or (None, None)
@@ -1611,7 +1628,7 @@ def cmd_ln(d, args):
         if not srcs:
             raise FormatError('ln: リンク先パスとリンクするファイルを指定してください')
         _, df = resolve_one(s.r, dest, args.fid, 'ln')
-        attrs = tuple(int(x, 0) for x in args.attrs.split('.')) if args.attrs else (0, 0, 0, 0, 0)
+        attrs = tuple(cli_int(x) for x in args.attrs.split('.')) if args.attrs else (0, 0, 0, 0, 0)
         if len(attrs) != 5:
             raise FormatError('ln: -a は 属性1.属性2.属性3.属性4.属性5 です')
         pos = args.pos
@@ -1961,7 +1978,7 @@ def main():
     p.add_argument('-l', dest='long', action='store_true', help='詳細表示')
     path_cmd('stat', 'ファイルヘッダの詳細')
     p = path_cmd('tp', 'レコード内容 (既定は生データを標準出力へ)', nargs=1)
-    p.add_argument('-r', dest='record', type=lambda x: int(x, 0), default=0, help='レコード番号 (既定 0)')
+    p.add_argument('-r', dest='record', type=cli_int, default=0, help='レコード番号 (既定 0)')
     p.add_argument('-e', dest='endian', action='store_true', help='エンディアン変換 (2 バイト単位で入れ替え)')
     m = p.add_mutually_exclusive_group()
     m.add_argument('-a', dest='mode', action='store_const', const='a', help='EUC 文字列として表示')
@@ -1974,7 +1991,7 @@ def main():
     p.add_argument('-v', dest='verbose', action='store_true', help='変更結果を表示')
     p.add_argument('path', metavar='PATH')
     p.add_argument('name', metavar='NAME')
-    num = lambda x: int(x, 0)
+    num = cli_int
     p = path_cmd('chmod', 'アクセスモード / 属性の表示・変更 (書き込み)', nargs='+')
     p.add_argument('-o', dest='owner', type=num, help='所有者アクセスモード 0〜7 (RWE)')
     p.add_argument('-g', dest='group', type=num, help='グループアクセスレベル 0x0RWE')
