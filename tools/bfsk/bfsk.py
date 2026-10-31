@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """bfsk - BTRON (超漢字V) ディスクイメージ操作ツール
 
-対応形式 (実イメージで確認した内容):
+対応イメージ形式 (内容から自動判別):
+  - raw (ディスク全体 / パーティション単体)
+  - VMDK monolithicSparse (非圧縮)
+  - VDI (dynamic / fixed)
+
+ファイルシステム (実イメージで確認した内容):
   - ディスク全体イメージ (MBR, パーティションタイプ 0x13) またはパーティション単体
   - 全フィールドがリトルエンディアン (仕様書 4章のフロッピー形式はビッグエンディアン)
   - 論理ブロック長はシステムヘッダから取得 (実例: 32768)
@@ -51,9 +56,136 @@ class FormatError(Exception):
     pass
 
 
+# ---------------------------------------------------------------------------
+# イメージ形式層: どの形式も read(offset, n) で仮想ディスクのバイト列を返す
+# ---------------------------------------------------------------------------
+class RawImage:
+    kind = 'raw'
+
+    def __init__(self, f):
+        self.f = f
+        f.seek(0, 2)
+        self.size = f.tell()
+
+    def read(self, off, n):
+        self.f.seek(off)
+        d = self.f.read(n)
+        return d + b'\0' * (n - len(d))      # 切り詰められたイメージ対策
+
+
+class _BlockMappedImage:
+    """固定長ブロック単位でファイル内位置へ対応付ける形式の共通処理."""
+
+    def read(self, off, n):
+        out = bytearray()
+        while n > 0:
+            idx, inner = divmod(off, self.bsize)
+            k = min(n, self.bsize - inner)
+            pos = self._lookup(idx) if off < self.size else None
+            if pos is None:
+                out += b'\0' * k
+            else:
+                self.f.seek(pos + inner)
+                d = self.f.read(k)
+                out += d + b'\0' * (k - len(d))
+            off += k
+            n -= k
+        return bytes(out)
+
+
+class VmdkSparseImage(_BlockMappedImage):
+    """VMware monolithicSparse (ヘッダ 'KDMV', 非圧縮)."""
+    kind = 'vmdk'
+
+    def __init__(self, f):
+        self.f = f
+        f.seek(0)
+        h = f.read(512)
+        (_, ver, flags, cap, grain, _, _, ngte, rgd, gd) = struct.unpack_from('<4sIIQQQQIQQ', h, 0)
+        comp = struct.unpack_from('<H', h, 77)[0]
+        if flags & 0x10000 or comp:
+            raise FormatError('圧縮 VMDK (streamOptimized) には未対応です')
+        if gd == 0xFFFFFFFFFFFFFFFF:
+            raise FormatError('グレインディレクトリがフッタにある VMDK には未対応です')
+        if ver not in (1, 2, 3):
+            raise FormatError('未対応の VMDK バージョン %d' % ver)
+        self.size = cap * 512
+        self.bsize = grain * 512
+        self.ngte = ngte
+        ngt = (cap // grain + ngte - 1) // ngte
+        f.seek(gd * 512)
+        self.gd = struct.unpack('<%dI' % ngt, f.read(ngt * 4))
+        self._gt = {}
+
+    def _lookup(self, g):
+        t, j = divmod(g, self.ngte)
+        if t >= len(self.gd) or self.gd[t] == 0:
+            return None
+        gt = self._gt.get(t)
+        if gt is None:
+            self.f.seek(self.gd[t] * 512)
+            gt = self._gt[t] = struct.unpack('<%dI' % self.ngte, self.f.read(self.ngte * 4))
+        s = gt[j]
+        return None if s <= 1 else s * 512     # 0: 未割当, 1: ゼログレイン
+
+
+class VdiImage(_BlockMappedImage):
+    """VirtualBox VDI (dynamic / fixed)."""
+    kind = 'vdi'
+    SIG = 0xBEDA107F
+
+    def __init__(self, f):
+        self.f = f
+        f.seek(0)
+        h = f.read(512)
+        sig, ver = struct.unpack_from('<II', h, 0x40)
+        if sig != self.SIG:
+            raise FormatError('VDI シグネチャ不正')
+        if ver >> 16 != 1:
+            raise FormatError('未対応の VDI バージョン %#x' % ver)
+        itype = struct.unpack_from('<I', h, 0x4C)[0]
+        if itype not in (1, 2):                  # 1: dynamic, 2: fixed (3: undo, 4: diff)
+            raise FormatError('差分/undo VDI (type %d) には未対応です' % itype)
+        off_bmap, off_data = struct.unpack_from('<II', h, 0x154)
+        self.size = struct.unpack_from('<Q', h, 0x170)[0]
+        self.bsize = struct.unpack_from('<I', h, 0x178)[0]
+        nblk = struct.unpack_from('<I', h, 0x180)[0]
+        self.off_data = off_data
+        f.seek(off_bmap)
+        self.bmap = struct.unpack('<%dI' % nblk, f.read(nblk * 4))
+
+    def _lookup(self, b):
+        if b >= len(self.bmap):
+            return None
+        v = self.bmap[b]
+        if v >= 0xFFFFFFFE:                      # 未割当 / ゼロブロック
+            return None
+        return self.off_data + v * self.bsize
+
+
+def open_image(path):
+    """ファイル内容から形式を自動判別して開く."""
+    f = open(path, 'rb')
+    head = f.read(0x50)
+    if head[:4] == b'KDMV':
+        return VmdkSparseImage(f)
+    if head.startswith(b'# Disk DescriptorFile'):
+        raise FormatError('記述子ファイル形式の VMDK (flat/分割) には未対応です')
+    if head[:4] == b'COWD':
+        raise FormatError('旧形式 VMDK (COWD) には未対応です')
+    if len(head) >= 0x44 and struct.unpack_from('<I', head, 0x40)[0] == VdiImage.SIG:
+        return VdiImage(f)
+    if head[:4] == b'QFI\xfb':
+        raise FormatError('qcow2 には未対応です (qemu-img convert -O raw で変換してください)')
+    raw = RawImage(f)
+    if raw.size >= 512 and raw.read(raw.size - 512, 8) == b'conectix':
+        raise FormatError('VHD には未対応です')
+    return raw
+
+
 class Disk:
     def __init__(self, path, part=None):
-        self.f = open(path, 'rb')
+        self.img = open_image(path)
         self.base = self._find_partition(part)
         h = self._read(self.base + SYS_OFFSET, 128)
         (self.disk_id, self.fmt_id, self.ssys, self.sfidt, self.sfnmt,
@@ -69,11 +201,7 @@ class Disk:
 
     # --- 低レベル ---
     def _read(self, off, n):
-        self.f.seek(off)
-        d = self.f.read(n)
-        if len(d) < n:
-            d += b'\0' * (n - len(d))   # 切り詰められたイメージ対策
-        return d
+        return self.img.read(off, n)
 
     def _find_partition(self, part):
         mbr = self._read(0, 512)
@@ -192,6 +320,7 @@ class BFile:
 
 
 def cmd_info(d, args):
+    print('image format     : %s' % d.img.kind)
     print('partition offset : 0x%x' % d.base)
     print('disk id / format : 0x%04x / 0x%04x' % (d.disk_id, d.fmt_id))
     print('block size       : %d' % d.blksz)
