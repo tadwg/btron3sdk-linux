@@ -12,6 +12,9 @@
   - 論理ブロック長はシステムヘッダから取得 (実例: 32768)
   - ブロック n のオフセット = パーティション先頭 + 0x1000 + (n-1) * ブロック長
     (ブロック0 = BOOT 領域のみ 4KB)
+  - ディスク形式ID 0x6402 は「拡張形式2」(超漢字V R4 仕様差分, 4GB超対応):
+    ファイルヘッダ +176 にレコードインデックス開始位置 (ridxofs) があり、
+    フラグメントテーブルは 8 バイト (size, offset, blk) × 可変個
 
 使い方:
   bfsk.py [-p N] IMAGE info
@@ -262,20 +265,43 @@ class BFile:
         self.t_keep, self.t_acc, self.t_upd, self.t_gen = struct.unpack_from('<4I', h, 92)
         self.name = tron_str(h[108:148])
         self.hdr_fid = struct.unpack_from('<H', h, 186)[0]
+        # 拡張形式2 (0x6402) はヘッダ +176 にレコードインデックス開始位置 ridxofs を持つ
+        # (超漢字V R4 仕様差分 4.3.3). それ以外は固定 384.
+        self.ridxofs = 384
+        if disk.fmt_id == 0x6402:
+            self.ridxofs = struct.unpack_from('<H', h, 176)[0]
+            if not (192 + 16 <= self.ridxofs <= disk.blksz - 16) or self.ridxofs % 16:
+                raise FormatError('レコードインデックス開始位置が不正です (%d)' % self.ridxofs)
+
+    def fragments(self):
+        """フラグメントテーブル (192 から ridxofs まで) を返す: [(size, block, offset)]."""
+        out = []
+        if self.disk.fmt_id == 0x6402:      # DfFragment2: UH size, UH offset, UW blk
+            for off in range(192, self.ridxofs - 7, 8):
+                size, boff, blk = struct.unpack_from('<HHI', self.hblock, off)
+                if size == 0:
+                    break
+                out.append((size, blk, boff))
+        else:                                # 6 バイト: size, ブロックアドレス*ブロック長+オフセット
+            for off in range(192, 384 - 5, 6):
+                size, pos = struct.unpack_from('<HI', self.hblock, off)
+                if size == 0:
+                    break
+                out.append((size, pos // self.disk.blksz, pos % self.disk.blksz))
+        return out
 
     @staticmethod
     def _slots(block, start):
-        """インデックス領域を 16 バイト単位で前から列挙.
-        実イメージではエントリはブロック末尾に詰めて配置され、その前は未使用(0)で埋まる."""
+        """インデックス領域を 16 バイト単位で前から列挙 (未使用エントリは呼び出し側で除外)."""
         for off in range(start, len(block) - 15, 16):
             yield block[off:off + 16]
 
     def _index_entries(self):
         """レコードインデックス (16バイト) を論理順に列挙."""
         if self.level == 0:
-            yield from self._slots(self.hblock, 384)
+            yield from self._slots(self.hblock, self.ridxofs)
             return
-        yield from self._walk_indirect(self.hblock, 384, self.level)
+        yield from self._walk_indirect(self.hblock, self.ridxofs, self.level)
 
     def _walk_indirect(self, block, start, level):
         # 間接インデックス (8バイト: 有効レコード数, 論理ブロックアドレス) を前から列挙
@@ -340,6 +366,8 @@ def cmd_records(d, args):
     print('level     : %d   records %d   links %d   bytes %d   blocks %d'
           % (f.level, f.nrec, f.nlink, f.size, f.nblk))
     print('created   : %s   updated %s' % (fmt_time(f.t_gen), fmt_time(f.t_upd)))
+    print('index ofs : %d   fragments: %s' % (f.ridxofs, ' '.join(
+        '%d@%d+%d' % fr for fr in f.fragments()) or '-'))
     if f.hdr_fid != f.fid:
         print('warning: ヘッダ内ファイルID %d が一致しません' % f.hdr_fid, file=sys.stderr)
     print()
