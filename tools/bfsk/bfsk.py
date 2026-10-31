@@ -886,7 +886,7 @@ class Checker:
             self.check_file(f, fnmt, owner, links_to)
         # --- 参照カウント
         for fid, f in files.items():
-            n = links_to.get(fid, 0)
+            n = links_to.get(fid, 0) + (1 if fid == 0 else 0)   # ルートは参照カウント 1 (4.2.5)
             if f.refcount != n:
                 self.err('fid %d %s: 参照カウント %d と実際の固定リンク数 %d が一致しない' % (fid, f.name, f.refcount, n))
         for fid in links_to:
