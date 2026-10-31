@@ -25,6 +25,8 @@
     fs [-l] [PATH..]             レコード構成
     stat [PATH..]                ファイルヘッダの詳細
     check [-v]                   整合性チェック (fsck 相当, 読み取りのみ)
+  書き込み (ブロック割り当てあり, FileManager 層):
+    mkf / rm / empf / ln / cp / rcp / apd / recv / cleanup   (詳細は README.md と -h)
   書き込み (ファイルヘッダのみ変更):
     ren PATH NAME                ファイル名の変更
     chmod [-o#][-g#][-p#][-a#] PATH..   アクセスモード / 属性
