@@ -36,6 +36,7 @@
 import argparse
 import datetime
 import fnmatch
+import os
 import struct
 import sys
 import time
@@ -199,7 +200,7 @@ class _BlockMappedImage:
             k = min(len(data) - pos, self.bsize - inner)
             fpos = self._lookup(idx)
             if fpos is None:
-                raise FormatError('%s の未割り当て領域への書き込みには未対応です (0x%x)' % (self.kind, off + pos))
+                fpos = self._allocate(idx)
             self.f.seek(fpos + inner)
             self.f.write(data[pos:pos + k])
             pos += k
@@ -227,6 +228,8 @@ class VmdkSparseImage(_BlockMappedImage):
         ngt = (cap // grain + ngte - 1) // ngte
         f.seek(gd * 512)
         self.gd = struct.unpack('<%dI' % ngt, f.read(ngt * 4))
+        f.seek(rgd * 512)
+        self.rgd = struct.unpack('<%dI' % ngt, f.read(ngt * 4)) if rgd else None
         self._gt = {}
 
     def _lookup(self, g):
@@ -236,9 +239,26 @@ class VmdkSparseImage(_BlockMappedImage):
         gt = self._gt.get(t)
         if gt is None:
             self.f.seek(self.gd[t] * 512)
-            gt = self._gt[t] = struct.unpack('<%dI' % self.ngte, self.f.read(self.ngte * 4))
+            gt = self._gt[t] = list(struct.unpack('<%dI' % self.ngte, self.f.read(self.ngte * 4)))
         s = gt[j]
         return None if s <= 1 else s * 512     # 0: 未割当, 1: ゼログレイン
+
+    def _allocate(self, g):
+        """グレインをファイル末尾に追加して割り当てる (グレインテーブルと冗長テーブルを更新)."""
+        t, j = divmod(g, self.ngte)
+        if t >= len(self.gd) or self.gd[t] == 0:
+            raise FormatError('VMDK: グレインテーブルが無い領域への書き込みには未対応です')
+        self._lookup(g)
+        self.f.seek(0, 2)
+        sec = (self.f.tell() + 511) // 512
+        self.f.seek(sec * 512)
+        self.f.write(b'\0' * self.bsize)
+        for tab in (self.gd, self.rgd):
+            if tab and tab[t]:
+                self.f.seek(tab[t] * 512 + j * 4)
+                self.f.write(struct.pack('<I', sec))
+        self._gt[t][j] = sec
+        return sec * 512
 
 
 class VdiImage(_BlockMappedImage):
@@ -263,8 +283,10 @@ class VdiImage(_BlockMappedImage):
         self.bsize = struct.unpack_from('<I', h, 0x178)[0]
         nblk = struct.unpack_from('<I', h, 0x180)[0]
         self.off_data = off_data
+        self.off_bmap = off_bmap
         f.seek(off_bmap)
-        self.bmap = struct.unpack('<%dI' % nblk, f.read(nblk * 4))
+        self.bmap = list(struct.unpack('<%dI' % nblk, f.read(nblk * 4)))
+        self.nalloc = struct.unpack_from('<I', h, 0x184)[0]
 
     def _lookup(self, b):
         if b >= len(self.bmap):
@@ -273,6 +295,22 @@ class VdiImage(_BlockMappedImage):
         if v >= 0xFFFFFFFE:                      # 未割当 / ゼロブロック
             return None
         return self.off_data + v * self.bsize
+
+    def _allocate(self, b):
+        """ブロックを末尾に追加して割り当てる (ブロックマップと割り当て数を更新)."""
+        if b >= len(self.bmap):
+            raise FormatError('VDI: 範囲外のブロックです')
+        idx = self.nalloc
+        pos = self.off_data + idx * self.bsize
+        self.f.seek(pos)
+        self.f.write(b'\0' * self.bsize)
+        self.bmap[b] = idx
+        self.f.seek(self.off_bmap + b * 4)
+        self.f.write(struct.pack('<I', idx))
+        self.nalloc += 1
+        self.f.seek(0x184)
+        self.f.write(struct.pack('<I', self.nalloc))
+        return pos
 
 
 def open_image(path, writable=False):
@@ -542,6 +580,9 @@ class BFile:
         """レコードの一覧を返す (dict のリスト)."""
         if getattr(self, '_recs', None) is not None:
             return self._recs
+        if self.ftype == 0:                  # リンクファイルはレコードを持たない
+            self._recs = []
+            return self._recs
         recs = []
         for e in self._index_entries():
             b0, b1 = e[0], e[1]
@@ -632,6 +673,7 @@ class Resolver:
         self.d = disk
         self._cache = {}
         self.link_attrs = {}            # 解決したパス → そこへ至るリンクの属性データ1〜5
+        self.link_pos = {}              # 解決したパス → (親ファイル fid, リンクレコード番号)
 
     def file(self, fid):
         f = self._cache.get(fid)
@@ -640,10 +682,10 @@ class Resolver:
         return f
 
     def children(self, f):
-        """(表示名, 名前, 出現順, fid, リンク属性) の列. 同名 2 つ目以降は "名前:N"."""
+        """(表示名, 名前, 出現順, fid, リンク属性, レコード番号) の列. 同名 2 つ目以降は "名前:N"."""
         seen = {}
         out = []
-        for _, fid, attrs in f.links():
+        for recno, fid, attrs in f.links():
             try:
                 name = self.file(fid).name
             except FormatError:
@@ -651,38 +693,39 @@ class Resolver:
             key = norm_name(name)
             n = seen.get(key, 0)
             seen[key] = n + 1
-            out.append((name if n == 0 else '%s:%d' % (name, n), name, n, fid, attrs))
+            out.append((name if n == 0 else '%s:%d' % (name, n), name, n, fid, attrs, recno))
         return out
 
     def resolve(self, path):
         """パスに一致する [(表示パス, BFile)] を返す (ワイルドカードで複数あり得る)."""
-        results = [([], [0], None)]     # (表示名リスト, fid スタック, 最後にたどったリンクの属性)
+        results = [([], [0], None, None)]   # (表示名, fid スタック, 最後のリンク属性, (親fid, レコード番号))
         for toks in split_path(path):
             word = ''.join(ch for _, ch in toks)
             nxt = []
-            for names, stack, la in results:
+            for names, stack, la, lp in results:
                 if word == '.' and all(t == 'lit' for t, _ in toks):
-                    nxt.append((names, stack, la))
+                    nxt.append((names, stack, la, lp))
                     continue
                 if word == '..' and all(t == 'lit' for t, _ in toks):
-                    nxt.append((names[:-1], stack[:-1] or [0], None))
+                    nxt.append((names[:-1], stack[:-1] or [0], None, None))
                     continue
                 pat, wild, occ = parse_comp(toks)
-                for disp, name, n, fid, attrs in self.children(self.file(stack[-1])):
+                for disp, name, n, fid, attrs, recno in self.children(self.file(stack[-1])):
                     if not fnmatch.fnmatchcase(norm_name(name), pat):
                         continue
                     if occ is not None and n != occ:
                         continue
                     if occ is None and not wild and n != 0:
                         continue
-                    nxt.append((names + [disp], stack + [fid], attrs))
+                    nxt.append((names + [disp], stack + [fid], attrs, (stack[-1], recno)))
             results = nxt
         if not results:
             raise FormatError('%s: ファイルが見つかりません' % path)
         out = []
-        for n, st, la in results:
+        for n, st, la, lp in results:
             p = '/' + '/'.join(n)
             self.link_attrs[p] = la
+            self.link_pos[p] = lp
             out.append((p, self.file(st[-1])))
         return out
 
@@ -741,7 +784,7 @@ def cmd_ls(d, args):
         if args.self_:
             entries = [(tpath, tf.fid, r.link_attrs.get(tpath))]
         else:
-            entries = [(disp, fid, attrs) for disp, _, _, fid, attrs in r.children(tf)]
+            entries = [(disp, fid, attrs) for disp, _, _, fid, attrs, _ in r.children(tf)]
             if len(targets) > 1:
                 print('%s:' % tpath)
         for disp, fid, lattrs in entries:
@@ -817,6 +860,429 @@ def cmd_stat(d, args):
         print('fragments : %s' % (' '.join('%d@%d+%d' % fr for fr in f.fragments()) or '-'))
         if f.hdr_fid != f.fid:
             print('warning: ヘッダ内ファイルID %d が一致しません' % f.hdr_fid, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# ファイル管理層: BTRON3 仕様 1.6.8 のシステムコールに相当する操作
+#   cre_fil / del_fil / ins_rec / apd_rec / del_rec / chg_fnm など
+#   ブロック割り当て方針: データレコードは新しいブロックの先頭から置く
+#   (既存レコードと同じブロックは共有しない). 区切りコード (4.3.8) と
+#   フラグメントテーブルはファイルのレコード配置から毎回作り直す.
+# ---------------------------------------------------------------------------
+REF_MAX = 255
+
+
+class FileManager:
+    def __init__(self, disk):
+        d = self.d = disk
+        if not d.writable:
+            raise FormatError('読み取り専用で開いています')
+        self.nbytes = d.nbmp * (4 if d.fmt_id != 0x6400 else 1)
+        self.bm_off = d.block_offset(1) + 128
+        self.bm = bytearray(d._read(self.bm_off, self.nbytes))
+        self.bad = d._read(self.bm_off + self.nbytes, self.nbytes)
+        self.dirty = set()
+        self.nfree = d.nfree
+        self.first_data = 1 + d.ssys + d.sfidt + d.sfnmt
+        self.hint = self.first_data
+        self.cache = {}
+
+    # --- ファイル -------------------------------------------------------
+    def file(self, fid):
+        f = self.cache.get(fid)
+        if f is None:
+            blk, ref = self.d.fid_entry(fid)
+            if blk == 0:
+                raise FormatError('ファイルID %d は存在しません' % fid)
+            f = self.cache[fid] = BFile(self.d, fid, blk, ref)
+        return f
+
+    def _fid_write(self, fid, blk, ref):
+        self.d.write(self.d.block_offset(self.d.fidt_blk) + fid * 4,
+                     struct.pack('<I', (min(ref, REF_MAX) << 24) | blk if blk else 0))
+
+    def refcount(self, fid):
+        return self.file(fid).refcount
+
+    def _set_ref(self, fid, n):
+        f = self.file(fid)
+        if n > REF_MAX and self.d.fmt_id == 0x6400:
+            raise FormatError('参照カウントが上限 (255) を越えます')
+        self._fid_write(fid, f.blk, n)
+        if self.d.fmt_id != 0x6400:
+            struct.pack_into('<I', f.hblock, 172, n if n >= REF_MAX else 0)
+            self.d.write(self.d.block_offset(f.blk), bytes(f.hblock[:192]))
+        f.ref = min(n, REF_MAX)
+
+    # --- ブロック ---------------------------------------------------------
+    def _bit(self, n):
+        return self.bm[n >> 3] >> (n & 7) & 1
+
+    def _setbit(self, n, v):
+        i = n >> 3
+        if v:
+            self.bm[i] |= 1 << (n & 7)
+        else:
+            self.bm[i] &= ~(1 << (n & 7)) & 0xFF
+        self.dirty.add(i)
+
+    def alloc(self, count):
+        """count ブロックを確保して [(開始ブロック, 個数)] を返す. 連続領域を優先する."""
+        if count == 0:
+            return []
+        if count > self.nfree:
+            raise FormatError('ディスクの領域が不足しています (%d ブロック必要, 空き %d)' % (count, self.nfree))
+        runs = []
+        need = count
+        n = self.hint
+        nlb = self.d.nlb
+        wrapped = False
+        # まず count 個の連続領域を探す. 見つからなければ見つかった順に寄せ集める
+        best = self._find_run(count)
+        if best is not None:
+            runs = [(best, count)]
+        else:
+            while need:
+                if n >= nlb:
+                    if wrapped:
+                        raise FormatError('ディスクの領域が不足しています')
+                    n, wrapped = self.first_data, True
+                if self.bm[n >> 3] == 0xFF and n & 7 == 0:
+                    n += 8
+                    continue
+                if not self._bit(n):
+                    start = n
+                    while n < nlb and need and not self._bit(n) and n - start < need:
+                        n += 1
+                    runs.append((start, n - start))
+                    need -= n - start
+                else:
+                    n += 1
+        out = []
+        for start, cnt in runs:
+            for b in range(start, start + cnt):
+                self._setbit(b, 1)
+            while cnt:
+                k = min(cnt, REF_MAX)
+                out.append((start, k))
+                start += k
+                cnt -= k
+        self.nfree -= count
+        self.hint = out[-1][0] + out[-1][1]
+        return out
+
+    def _find_run(self, count):
+        nlb = self.d.nlb
+        for base in (self.hint, self.first_data):
+            n = base
+            run = 0
+            while n < nlb:
+                if run == 0 and n & 7 == 0 and self.bm[n >> 3] == 0xFF:
+                    n += 8
+                    continue
+                if self._bit(n):
+                    run = 0
+                else:
+                    run += 1
+                    if run == count:
+                        return n - count + 1
+                n += 1
+        return None
+
+    def free(self, blocks):
+        for b in blocks:
+            if not self._bit(b):
+                raise FormatError('ブロック %d は既に未使用です' % b)
+            if self.bad[b >> 3] >> (b & 7) & 1:
+                continue
+            self._setbit(b, 0)
+            self.nfree += 1
+
+    def sync(self):
+        """ビットマップ・空きブロック数・システムブロック更新日時を書き込む."""
+        if self.dirty:
+            lo, hi = min(self.dirty), max(self.dirty) + 1
+            self.d.write(self.bm_off + lo, bytes(self.bm[lo:hi]))
+            self.dirty.clear()
+        sys_off = self.d.block_offset(1)
+        self.d.write(sys_off + 36, struct.pack('<II', self.nfree, now_btron()))
+        self.d.nfree = self.nfree
+
+    # --- ファイル生成 / 削除 (cre_fil / del_fil) ---------------------------
+    def default_ridxofs(self):
+        if self.d.fmt_id != 0x6402:
+            return 384
+        # 実イメージ (32KB ブロック) の新規ファイルは 6336 = 192 + ブロック長 * 3/16
+        return min(192 + (self.d.blksz * 3 // 16 + 15) // 16 * 16, self.d.blksz - 16)
+
+    def cre_fil(self, parent, name, atype=0, ftype=0x1000, grpacc=0, pubacc=0x0FFF):
+        """ファイル生成. parent を指定すると末尾にリンクレコードを追加する (F_FIX)."""
+        d = self.d
+        name40 = tron_encode(name)
+        fidt = d._read(d.block_offset(d.fidt_blk), d.nfmax * 4)
+        fid = next((i for i in range(1, d.nfmax) if fidt[i * 4:i * 4 + 4] == b'\0\0\0\0'), None)
+        if fid is None:
+            raise FormatError('最大ファイル数を越えました')
+        (blk, _), = self.alloc(1)
+        t = now_btron()
+        h = bytearray(d.blksz)
+        struct.pack_into('<IHH', h, 0, FH_START, ftype, atype)
+        struct.pack_into('<HHhh', h, 64, grpacc, pubacc, 0, 0)
+        struct.pack_into('<III', h, 72, 0, 1, 0)
+        struct.pack_into('<IIII', h, 92, 0xFFFFFFFF, t, t, t)
+        h[108:148] = name40
+        if d.fmt_id == 0x6402:
+            struct.pack_into('<H', h, 176, self.default_ridxofs())
+        struct.pack_into('<HI', h, 186, fid, FH_END)
+        d.write(d.block_offset(blk), bytes(h))
+        self._fid_write(fid, blk, 0)
+        d.set_short_name(fid, short_name(name40))
+        self.cache.pop(fid, None)
+        if parent is not None:
+            self.ins_rec(parent, None, 0, 0, link=(fid, (0, 0, 0, 0, 0)))
+        return fid
+
+    def copy_header(self, src, name=None):
+        """ファイルヘッダ (属性・日時など) を引き継いだ空のファイルを作る (参照カウント 0)."""
+        f = self.file(src)
+        fid = self.cre_fil(None, name or f.name, f.apptype, (f.ftype << 12) | f.attr, *f.acc_levels)
+        g = self.file(fid)
+        if f.ftype == 0:      # リンクファイル: ファイル所在データ等をそのまま複製
+            g.hblock[176:178] = f.hblock[176:178]
+            g.hblock[192:] = f.hblock[192:]
+            self.d.write(self.d.block_offset(g.blk), bytes(g.hblock))
+            self.cache.pop(fid, None)
+        return fid
+
+    def _delete_file(self, fid, recursive):
+        """参照カウント 0 のファイルを削除する. recursive なら含まれるリンク先も参照 0 で削除."""
+        f = self.file(fid)
+        if f.level:
+            raise FormatError('%s: インデックスレベル 1 以上のファイルの削除には未対応です' % f.name)
+        blocks = {f.blk}
+        children = []
+        for r in f.records():
+            if r['kind'] == 'link':
+                children.append(r['link_fid'])
+            else:
+                for b, c in r['extents']:
+                    blocks.update(range(b, b + c))
+        self.free(sorted(blocks))
+        self._fid_write(fid, 0, 0)
+        self.d.set_short_name(fid, 0)
+        self.cache.pop(fid, None)
+        removed = [fid]
+        for c in children:
+            if self.d.fid_entry(c)[0] == 0:      # 既に削除済み (循環参照)
+                continue
+            n = self.refcount(c) - 1
+            self._set_ref(c, n)
+            if n == 0 and recursive:
+                removed += self._delete_file(c, True)
+        return removed
+
+    def del_fil(self, parent, recno, recursive=False):
+        """parent のレコード recno (リンク) を削除し、参照 0 になればファイル本体を削除する."""
+        pf = self.file(parent)
+        rec = pf.records()[recno]
+        if rec['kind'] != 'link':
+            raise FormatError('レコード %d はリンクレコードではありません' % recno)
+        fid = rec['link_fid']
+        f = self.file(fid)
+        if fid == 0:
+            raise FormatError('ルートファイルは削除できません')
+        if f.refcount <= 1:
+            if f.attr & 0x20:
+                raise FormatError('%s は削除不可属性です' % f.name)
+            if f.nlink and not recursive:
+                raise FormatError('%s はリンクレコードを含んでいます (-r で中も削除)' % f.name)
+        self.del_rec(parent, recno, delete_unref=False)
+        if self.refcount(fid) == 0:
+            return self._delete_file(fid, recursive)
+        return []
+
+    # --- レコード操作 (ins_rec / apd_rec / del_rec) ------------------------
+    def _place_data(self, data):
+        """データを新しいブロックに書き込み (開始オフセット, extents) を返す."""
+        bs = self.d.blksz
+        size = len(data)
+        if size == 0:
+            return 0, []
+        lead = 0
+        if (-size) % bs == 1:            # 末尾に 1 バイトだけ残ると区切りコードが置けない
+            lead = 2
+        nblk = (lead + size + bs - 1) // bs
+        ext = self.alloc(nblk)
+        buf = bytes(lead) + data
+        pos = 0
+        for b, c in ext:
+            self.d.write(self.d.block_offset(b), buf[pos:pos + c * bs].ljust(c * bs, b'\0'))
+            pos += c * bs
+        return lead, ext
+
+    def ins_rec(self, fid, recno, rtype, subtype, data=b'', link=None):
+        """recno の直前 (None なら末尾 = apd_rec) にレコードを挿入する.
+        rtype 0 はリンクレコードで link = (リンク先 fid, 属性データ1〜5)."""
+        f = self.file(fid)
+        self._writable(f)
+        recs = list(f.records())
+        if recno is None:
+            recno = len(recs)
+        if not 0 <= recno <= len(recs):
+            raise FormatError('レコード番号 %d は範囲外です' % recno)
+        if rtype == 0:
+            lfid, attrs = link
+            target = self.file(lfid)
+            new = {'kind': 'link', 'type': 0, 'subtype': subtype, 'link_fid': lfid,
+                   'attrs': tuple(attrs), 'size': 0, 'extents': []}
+            self._set_ref(lfid, target.refcount + 1)
+        else:
+            if not 1 <= rtype <= 31:
+                raise FormatError('レコードタイプは 1〜31 です')
+            off, ext = self._place_data(bytes(data))
+            new = {'kind': 'data', 'type': rtype, 'subtype': subtype, 'offset': off,
+                   'size': len(data), 'extents': ext}
+        recs.insert(recno, new)
+        self._store(f, recs, touched={b for b, _ in new['extents']})
+        return recno
+
+    def apd_rec(self, fid, rtype, subtype, data=b'', link=None):
+        return self.ins_rec(fid, None, rtype, subtype, data, link)
+
+    def del_rec(self, fid, recno, delete_unref=False):
+        """レコード削除. リンクレコードならリンク先の参照カウントを -1 する.
+        戻り値: リンク先の参照カウントが 0 になったら 1 (del_rec と同じ)."""
+        f = self.file(fid)
+        self._writable(f)
+        recs = list(f.records())
+        if not 0 <= recno < len(recs):
+            raise FormatError('レコード番号 %d は範囲外です' % recno)
+        old = recs.pop(recno)
+        ret = 0
+        touched = set()
+        if old['kind'] == 'link':
+            n = self.refcount(old['link_fid']) - 1
+            self._set_ref(old['link_fid'], n)
+            ret = 1 if n == 0 else 0
+        else:
+            still = {b for r in recs if r['kind'] == 'data'
+                     for b0, c in r['extents'] for b in range(b0, b0 + c)}
+            mine = {b for b0, c in old['extents'] for b in range(b0, b0 + c)}
+            self.free(sorted(mine - still))
+            touched = mine & still
+        self._store(f, recs, touched=touched)
+        if ret and delete_unref:
+            self._delete_file(old['link_fid'], True)
+        return ret
+
+    def _writable(self, f):
+        if f.ftype == 0:
+            raise FormatError('%s はリンクファイルです' % f.name)
+        if f.level:
+            raise FormatError('%s: インデックスレベル 1 以上のファイルの変更には未対応です' % f.name)
+
+    # --- ファイルの書き戻し ------------------------------------------------
+    @staticmethod
+    def _index_entries(recs):
+        out = []
+        for r in recs:
+            if r['kind'] == 'link':
+                e = struct.pack('<BBHH5H', 0, 0x80, r['subtype'], r['link_fid'], *r['attrs'])
+                out.append(e)
+                continue
+            ext = list(r['extents'])
+            first = ext.pop(0) if ext else (0, 0)
+            out.append(struct.pack('<BBHHHII', 0, 0x80 | r['type'], r['subtype'], 0, r['offset'], r['size'],
+                                   (first[0] << 8) | first[1] if first[1] else 0))
+            while ext:
+                grp, ext = ext[:4], ext[4:]
+                out.append(b''.join(struct.pack('<I', (b << 8) | c) for b, c in grp).ljust(16, b'\0'))
+        return out
+
+    def _layout(self, f, recs):
+        """ブロックごとのレコード範囲: {blk: [(開始, 終了)]}, 使用ブロック集合."""
+        bs = self.d.blksz
+        pieces, blocks = {}, set()
+        for r in recs:
+            if r['kind'] != 'data':
+                continue
+            remain, start = r['size'], r['offset']
+            for b0, c in r['extents']:
+                for b in range(b0, b0 + c):
+                    blocks.add(b)
+                    if remain > 0:
+                        n = min(remain, bs - start)
+                        pieces.setdefault(b, []).append((start, start + n))
+                        remain -= n
+                        start = 0
+        return pieces, blocks
+
+    def _codes(self, ps):
+        """ブロック内のレコード範囲から区切りコードと空き領域を求める (4.3.8 図73)."""
+        bs = self.d.blksz
+        codes, free = [], []
+        pos = 0
+        for a, b in sorted(ps):
+            gap = a - pos
+            if pos == 0 and gap:
+                codes.append((a - 2, gap - 2))
+                if gap - 2:
+                    free.append((0, gap - 2))
+            elif pos:
+                codes += [(pos, gap - 4), (a - 2, gap - 4)]
+                if gap - 4:
+                    free.append((pos + 2, gap - 4))
+            pos = b
+        if 0 < pos < bs:
+            codes.append((pos, bs - pos - 2))
+            if bs - pos - 2:
+                free.append((pos + 2, bs - pos - 2))
+        return codes, free
+
+    def _store(self, f, recs, touched=()):
+        d = self.d
+        bs = d.blksz
+        entries = self._index_entries(recs)
+        cap = (bs - f.ridxofs) // 16
+        if len(entries) > cap:
+            raise FormatError('%s: レコードインデックスが %d 個を越えます (インデックスレベル 1 以上は未対応)'
+                              % (f.name, cap))
+        pieces, blocks = self._layout(f, recs)
+        frees = []
+        for b in set(touched) | set(pieces):
+            codes, free = self._codes(pieces.get(b, []))
+            if b in touched:
+                blk = bytearray(d.read_block(b))
+                for pos, val in codes:
+                    struct.pack_into('<H', blk, pos, val)
+                d.write(d.block_offset(b), bytes(blk))
+            frees += [(size, b, off) for off, size in free]
+        frees.sort(key=lambda x: (-x[0], x[1], x[2]))
+        h = f.hblock
+        if d.fmt_id == 0x6402:
+            nfr = (f.ridxofs - 192) // 8
+            area = b''.join(struct.pack('<HHI', sz, off, b) for sz, b, off in frees[:nfr])
+            h[192:f.ridxofs] = area.ljust(f.ridxofs - 192, b'\0')
+        else:
+            area = b''.join(struct.pack('<HI', sz, b * bs + off) for sz, b, off in frees[:32])
+            h[192:384] = area.ljust(192, b'\0')
+        idx = b''.join(entries)
+        h[f.ridxofs:] = idx.rjust(bs - f.ridxofs, b'\0')      # 末尾に詰めて置く (実イメージと同じ)
+        t = now_btron()
+        nlink = sum(1 for r in recs if r['kind'] == 'link')
+        struct.pack_into('<hh', h, 68, nlink, 0)
+        struct.pack_into('<III', h, 72, sum(r['size'] for r in recs if r['kind'] == 'data'),
+                         1 + len(blocks), len(recs))
+        struct.pack_into('<II', h, 96, t, t)
+        d.write(d.block_offset(f.blk), bytes(h))
+        self.cache.pop(f.fid, None)
+
+    def set_name(self, fid, name):
+        f = self.file(fid)
+        name40 = tron_encode(name)
+        f.update_header({H_NAME: ('40s', name40), H_ATIME: ('<I', now_btron())})
+        self.d.set_short_name(fid, short_name(name40))
+        self.cache.pop(fid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1027,6 +1493,326 @@ def cmd_check(d, args):
 
 
 # ---------------------------------------------------------------------------
+# 書き込みコマンド (ブロック割り当てあり) — FileManager を使う
+# ---------------------------------------------------------------------------
+def split_parent(path):
+    """パスを (親パス, 最後の名前) に分ける. 名前は % エスケープを解いた文字列."""
+    i, last, esc = 0, -1, False
+    for k, ch in enumerate(path.rstrip('/') if not path.endswith('%/') else path):
+        if esc:
+            esc = False
+        elif ch == '%':
+            esc = True
+        elif ch == '/':
+            last = k
+    body = path.rstrip('/') if not path.endswith('%/') else path
+    parent, name = (body[:last] or '/', body[last + 1:]) if last >= 0 else ('/', body)
+    toks = split_path(name)
+    if len(toks) != 1:
+        raise FormatError('%s: 名前が空です' % path)
+    return parent, ''.join(ch for _, ch in toks[0])
+
+
+def resolve_one(r, spec, by_fid, what):
+    if by_fid:
+        return '#%s' % spec, r.file(int(spec, 0))
+    t = r.resolve(spec)
+    if len(t) != 1:
+        raise FormatError('%s: %s に %d 件一致しました (1 件だけ指定してください)' % (what, spec, len(t)))
+    return t[0]
+
+
+def parse_pair(spec, what, default2=None):
+    parts = spec.split('.')
+    try:
+        a = int(parts[0], 0)
+        b = int(parts[1], 0) if len(parts) > 1 and parts[1] != '' else default2
+    except ValueError:
+        raise FormatError('%s の指定が不正です: %s' % (what, spec))
+    return a, b
+
+
+class Session:
+    """コマンド 1 回分: FileManager とパス解決を持ち、最後に必ず sync する."""
+    def __init__(self, d):
+        self.d = d
+        self.fm = FileManager(d)
+        self.r = Resolver(d)
+
+    def fresh(self):
+        self.r = Resolver(self.d)          # レコード番号が変わるので解決結果を作り直す
+        return self.r
+
+
+def run_session(d, body):
+    sess = Session(d)
+    try:
+        return body(sess)
+    finally:
+        sess.fm.sync()
+
+
+def cmd_mkf(d, args):
+    def body(s):
+        for path in args.paths:
+            parent, name = split_parent(path)
+            _, pf = resolve_one(s.fresh(), parent, False, 'mkf')
+            fid = s.fm.cre_fil(pf.fid, name, args.atype)
+            if args.verbose:
+                print('%s (fid %d)' % (path, fid))
+    return run_session(d, body)
+
+
+def _rm_targets(s, args):
+    """削除対象: [(親 fid or None, fid, 表示名)]. 同じ親の中は後ろのレコードから."""
+    out = []
+    for spec in args.paths:
+        if args.fid:
+            out.append((None, int(spec, 0), None, '#' + spec))
+            continue
+        for p, f in s.r.resolve(spec):
+            parent, recno = s.r.link_pos[p] or (None, None)
+            out.append((parent, f.fid, recno, p))
+    out.sort(key=lambda x: (x[0] is None, x[0] or 0, -(x[2] or 0)))
+    return out
+
+
+def cmd_rm(d, args):
+    def body(s):
+        for parent, fid, recno, name in _rm_targets(s, args):
+            if parent is None:
+                if s.fm.refcount(fid):
+                    raise FormatError('%s: 参照カウントが 0 でないため削除できません' % name)
+                removed = s.fm._delete_file(fid, args.recursive)
+            else:
+                rec = s.fm.file(parent).records()[recno]
+                if rec['kind'] != 'link' or rec['link_fid'] != fid:
+                    raise FormatError('%s: リンクレコードの位置が変わりました' % name)
+                removed = s.fm.del_fil(parent, recno, args.recursive)
+            if args.verbose:
+                print('%s: リンク削除%s' % (name, ', ファイル削除 %d 個' % len(removed) if removed else ''))
+    return run_session(d, body)
+
+
+def cmd_empf(d, args):
+    def body(s):
+        for _, f in s.r.targets(args):
+            fid = f.fid
+            while s.fm.file(fid).records():
+                s.fm.del_rec(fid, len(s.fm.file(fid).records()) - 1, delete_unref=True)
+    return run_session(d, body)
+
+
+def cmd_ln(d, args):
+    def body(s):
+        *srcs, dest = args.paths
+        if not srcs:
+            raise FormatError('ln: リンク先パスとリンクするファイルを指定してください')
+        _, df = resolve_one(s.r, dest, args.fid, 'ln')
+        attrs = tuple(int(x, 0) for x in args.attrs.split('.')) if args.attrs else (0, 0, 0, 0, 0)
+        if len(attrs) != 5:
+            raise FormatError('ln: -a は 属性1.属性2.属性3.属性4.属性5 です')
+        pos = args.pos
+        for spec in srcs:
+            for _, f in ([resolve_one(s.r, spec, True, 'ln')] if args.fid else s.r.resolve(spec)):
+                s.fm.ins_rec(df.fid, pos, 0, 0, link=(f.fid, attrs))
+                if pos is not None:
+                    pos += 1
+    return run_session(d, body)
+
+
+def _copy_records(s, src_fid, dst_fid, pos, recs, override=None, recursive=False, mapping=None):
+    """recs (src のレコード) を dst の pos から順に挿入する."""
+    src = s.fm.file(src_fid)
+    items = []
+    for r in recs:
+        if r['kind'] == 'link':
+            items.append(('link', r))
+        else:
+            items.append(('data', r, src.read_record(r)))
+    for it in items:
+        r = it[1]
+        if it[0] == 'link':
+            target = r['link_fid']
+            if recursive:
+                target = _copy_tree(s, target, mapping)
+            s.fm.ins_rec(dst_fid, pos, 0, r['subtype'], link=(target, r['attrs']))
+        else:
+            t, st = (r['type'], r['subtype'])
+            if override:
+                t = override[0]
+                st = override[1] if override[1] is not None else st
+            s.fm.ins_rec(dst_fid, pos, t, st, it[2])
+        if pos is not None:
+            pos += 1
+
+
+def _copy_tree(s, fid, mapping):
+    if fid in mapping:
+        return mapping[fid]
+    f = s.fm.file(fid)
+    new = s.fm.copy_header(fid) if f.ftype == 0 else s.fm.cre_fil(None, f.name, f.apptype)
+    mapping[fid] = new
+    if f.ftype != 0:
+        _copy_records(s, fid, new, None, list(f.records()), recursive=True, mapping=mapping)
+    return new
+
+
+def cmd_cp(d, args):
+    def body(s):
+        *srcs, dest = args.paths
+        if not srcs:
+            raise FormatError('cp: 複製するファイルと複製先を指定してください')
+        _, df = resolve_one(s.r, dest, args.fid, 'cp')
+        mapping = {}
+        for spec in srcs:
+            for p, f in ([resolve_one(s.r, spec, True, 'cp')] if args.fid else s.r.resolve(spec)):
+                la = s.r.link_attrs.get(p) or (0, 0, 0, 0, 0)
+                if args.recursive:
+                    new = _copy_tree(s, f.fid, mapping)
+                else:
+                    new = s.fm.copy_header(f.fid) if f.ftype == 0 else s.fm.cre_fil(None, f.name, f.apptype)
+                    if f.ftype != 0:
+                        _copy_records(s, f.fid, new, None, list(f.records()))
+                s.fm.apd_rec(df.fid, 0, 0, link=(new, la))
+                if args.verbose:
+                    print('%s -> %s (fid %d)' % (p, dest, new))
+    return run_session(d, body)
+
+
+def cmd_rcp(d, args):
+    def body(s):
+        _, sf = resolve_one(s.r, args.src, args.fid, 'rcp')
+        try:
+            _, df = resolve_one(s.r, args.dest, args.fid, 'rcp')
+        except FormatError:
+            if args.fid:
+                raise
+            parent, name = split_parent(args.dest)
+            _, pf = resolve_one(s.r, parent, False, 'rcp')
+            df = s.fm.file(s.fm.cre_fil(pf.fid, name, sf.apptype))
+        if df.fid == sf.fid:
+            raise FormatError('rcp: 複製元と複製先が同じです')
+        while s.fm.file(df.fid).records():
+            s.fm.del_rec(df.fid, len(s.fm.file(df.fid).records()) - 1, delete_unref=True)
+        _copy_records(s, sf.fid, df.fid, None, list(s.fm.file(sf.fid).records()),
+                      recursive=args.recursive, mapping={})
+    return run_session(d, body)
+
+
+def cmd_apd(d, args):
+    def body(s):
+        _, f1 = resolve_one(s.r, args.path1, args.fid, 'apd')
+        n1 = len(f1.records())
+        pos = args.pos
+        if args.delete:
+            start, cnt = parse_pair(args.delete, '-d', 1)
+            if not 0 <= start < n1 or cnt < 1 or start + cnt > n1:
+                raise FormatError('apd: 削除範囲が不正です')
+            pos = start
+        recs = []
+        src_fid = None
+        if args.path2:
+            _, f2 = resolve_one(s.r, args.path2, args.fid, 'apd')
+            src_fid = f2.fid
+            recs = list(f2.records())
+            if args.range:
+                a, cnt = parse_pair(args.range, '-r', 1)
+                if not 0 <= a < len(recs):
+                    raise FormatError('apd: 複製開始レコード %d は範囲外です' % a)
+                recs = recs[a:a + cnt]
+            # 複製元のデータを削除前に読んでおく (同じファイル同士でも安全)
+            recs = [dict(r, _data=f2.read_record(r)) if r['kind'] == 'data' else r for r in recs]
+        elif not args.delete:
+            raise FormatError('apd: 複製元のファイル (PATH2) または -d を指定してください')
+        override = parse_pair(args.type, '-t') if args.type else None
+        if override and override[0] == 0:
+            raise FormatError('apd: -t のレコードタイプは 1〜31 です')
+        if args.delete:
+            for _ in range(cnt):
+                s.fm.del_rec(f1.fid, pos)
+        if pos is not None and not 0 <= pos <= len(s.fm.file(f1.fid).records()):
+            raise FormatError('apd: 挿入位置 %d は範囲外です' % pos)
+        for r in recs:
+            if r['kind'] == 'link':
+                if override:
+                    raise FormatError('apd: リンクレコードには -t を指定できません')
+                s.fm.ins_rec(f1.fid, pos, 0, r['subtype'], link=(r['link_fid'], r['attrs']))
+            else:
+                t = override[0] if override else r['type']
+                st = override[1] if override and override[1] is not None else r['subtype']
+                s.fm.ins_rec(f1.fid, pos, t, st, r['_data'])
+            if pos is not None:
+                pos += 1
+    return run_session(d, body)
+
+
+def cmd_recv(d, args):
+    def body(s):
+        *hosts, dest = args.paths
+        if not hosts:
+            raise FormatError('recv: 取り込むファイルと取り込み先を指定してください')
+        _, df = resolve_one(s.r, dest, args.fid, 'recv')
+        rtype, sub = parse_pair(args.type, '-t', 0) if args.type else (31, 0)
+        for h in hosts:
+            data = open(h, 'rb').read()
+            if args.strip_eof and data.endswith(b'\x1a'):
+                data = data[:-1]
+            name = args.name or os.path.basename(h)
+            for disp, n, _, fid, _, recno in Resolver(d).children(s.fm.file(df.fid)):
+                if norm_name(n) == norm_name(tron_str(tron_encode(name))) and args.replace:
+                    s.fm.del_fil(df.fid, recno, True)
+                    break
+                if norm_name(n) == norm_name(tron_str(tron_encode(name))):
+                    raise FormatError('recv: %s は既に存在します (-d で置き換え)' % disp)
+            fid = s.fm.cre_fil(df.fid, name, args.atype)
+            s.fm.apd_rec(fid, rtype, sub, data)
+            if args.verbose:
+                print('%s -> fid %d (%d バイト)' % (h, fid, len(data)))
+    return run_session(d, body)
+
+
+def find_garbage(d):
+    """ルートから到達できないファイル: (到達可能集合, くずファイル一覧)."""
+    seen, stack = {0}, [0]
+    while stack:
+        for _, c, _ in d.open_file(stack.pop()).links():
+            if c not in seen and d.fid_entry(c)[0]:
+                seen.add(c)
+                stack.append(c)
+    fidt = d._read(d.block_offset(d.fidt_blk), d.nfmax * 4)
+    garbage = [fid for fid in range(d.nfmax)
+               if fidt[fid * 4:fid * 4 + 4] != b'\0\0\0\0' and fid not in seen]
+    return seen, garbage
+
+
+def cmd_cleanup(d, args):
+    seen, garbage = find_garbage(d)
+    if args.verbose or args.dry_run:
+        for fid in garbage:
+            print('fid %d %s' % (fid, d.open_file(fid).name))
+    if args.dry_run:
+        print('くずファイル %d 個' % len(garbage))
+        return
+
+    def body(s):
+        for fid in garbage:             # 到達可能なファイルへのリンクだけ参照カウントを戻す
+            for _, c, _ in s.fm.file(fid).links():
+                if c in seen:
+                    s.fm._set_ref(c, s.fm.refcount(c) - 1)
+        for fid in garbage:
+            f = s.fm.file(fid)
+            blocks = {f.blk} | {b for r in f.records() if r['kind'] == 'data'
+                                for b0, c in r['extents'] for b in range(b0, b0 + c)}
+            s.fm.free(sorted(blocks))
+            s.fm._fid_write(fid, 0, 0)
+            d.set_short_name(fid, 0)
+            s.fm.cache.pop(fid, None)
+        print('くずファイル %d 個を削除しました' % len(garbage))
+    return run_session(d, body)
+
+
+# ---------------------------------------------------------------------------
 # 書き込みコマンド (ファイルヘッダのみ変更)
 # ---------------------------------------------------------------------------
 H_TYPE, H_GRPACC, H_PUBACC, H_LTIME, H_ATIME, H_MTIME, H_NAME = 4, 64, 66, 92, 96, 100, 108
@@ -1198,15 +1984,54 @@ def main():
     p.add_argument('-a', dest='atime', metavar='Y.M.D.h.m.s', help='最新アクセス日時')
     p.add_argument('-m', dest='mtime', metavar='Y.M.D.h.m.s', help='最新更新日時')
     path_cmd('touch', '更新日時・アクセス日時を現在に (書き込み)', nargs='+')
+    p = path_cmd('mkf', 'ファイル生成 (書き込み)', nargs='+')
+    p.add_argument('-t', dest='atype', type=num, default=0, help='アプリケーションタイプ (既定 0)')
+    p.add_argument('-v', dest='verbose', action='store_true')
+    p = path_cmd('rm', 'ファイル (へのリンク) 削除 (書き込み)', nargs='+')
+    p.add_argument('-r', dest='recursive', action='store_true', help='含まれるリンク先も参照 0 になれば削除')
+    p.add_argument('-v', dest='verbose', action='store_true')
+    path_cmd('empf', 'ファイル内のレコードをすべて削除 (書き込み)', nargs='+')
+    p = path_cmd('ln', 'リンク追加: ln PATH.. DEST (書き込み)', nargs='+')
+    p.add_argument('-p', dest='pos', type=num, help='挿入レコード位置 (既定: 最後)')
+    p.add_argument('-a', dest='attrs', metavar='A1.A2.A3.A4.A5', help='リンク属性データ (既定 0)')
+    p = path_cmd('cp', 'ファイル複製: cp PATH.. DEST (書き込み)', nargs='+')
+    p.add_argument('-r', dest='recursive', action='store_true', help='リンク先のファイルも複製')
+    p.add_argument('-v', dest='verbose', action='store_true')
+    p = sub.add_parser('rcp', help='名前を付けて複製 / 内容の置き換え: rcp SRC NEWPATH (書き込み)')
+    p.add_argument('-i', '--fid', action='store_true', help='PATH の代わりにファイルID で指定')
+    p.add_argument('-r', dest='recursive', action='store_true', help='リンク先のファイルも複製')
+    p.add_argument('src', metavar='SRC')
+    p.add_argument('dest', metavar='NEWPATH')
+    p = sub.add_parser('apd', help='レコードの挿入 / 追加 / 削除 (書き込み)')
+    p.add_argument('-i', '--fid', action='store_true', help='PATH の代わりにファイルID で指定')
+    p.add_argument('-p', dest='pos', type=num, help='PATH1 の挿入位置 (既定: 最後)')
+    p.add_argument('-d', dest='delete', metavar='N.C', help='PATH1 のレコード N から C 個削除 (その位置に挿入)')
+    p.add_argument('-r', dest='range', metavar='N.C', help='PATH2 のレコード N から C 個を複製 (既定: 全部)')
+    p.add_argument('-t', dest='type', metavar='T.S', help='複製後のレコードタイプ.サブタイプ')
+    p.add_argument('path1', metavar='PATH1')
+    p.add_argument('path2', metavar='PATH2', nargs='?')
+    p = path_cmd('recv', 'Linux のファイルを取り込む: recv HOSTFILE.. DEST (書き込み)', nargs='+')
+    p.add_argument('-d', dest='replace', action='store_true', help='同名ファイルがあれば削除して置き換え')
+    p.add_argument('-c', dest='strip_eof', action='store_true', help='最後の Ctrl-Z を削除')
+    p.add_argument('-t', dest='type', metavar='T.S', help='レコードタイプ.サブタイプ (既定 31.0)')
+    p.add_argument('-a', dest='atype', type=num, default=0, help='アプリケーションタイプ (既定 0)')
+    p.add_argument('-N', dest='name', help='ファイル名 (既定: Linux 側のファイル名)')
+    p.add_argument('-v', dest='verbose', action='store_true')
+    p = sub.add_parser('cleanup', help='ルートから到達できないファイルを削除 (書き込み)')
+    p.add_argument('-n', dest='dry_run', action='store_true', help='表示のみ')
+    p.add_argument('-v', dest='verbose', action='store_true')
     args = ap.parse_args()
-    writes = {'ren', 'touch'} | ({'chmod'} if args.cmd == 'chmod' and any(
+    writes = {'ren', 'touch', 'mkf', 'rm', 'empf', 'ln', 'cp', 'rcp', 'apd', 'recv'} | (
+        {'cleanup'} if args.cmd == 'cleanup' and not args.dry_run else set()) | ({'chmod'} if args.cmd == 'chmod' and any(
         getattr(args, k) is not None for k in ('owner', 'group', 'public', 'attr')) else set()) | (
         {'chtime'} if args.cmd == 'chtime' and any(
             getattr(args, k) is not None for k in ('ltime', 'atime', 'mtime')) else set())
     try:
         d = Disk(args.image, args.partition, args.fsname, writable=args.cmd in writes)
         rc = {'info': cmd_info, 'df': cmd_df, 'check': cmd_check, 'ls': cmd_ls, 'fs': cmd_fs, 'stat': cmd_stat, 'tp': cmd_tp,
-         'ren': cmd_ren, 'chmod': cmd_chmod, 'chtime': cmd_chtime, 'touch': cmd_touch}[args.cmd](d, args)
+         'ren': cmd_ren, 'chmod': cmd_chmod, 'chtime': cmd_chtime, 'touch': cmd_touch,
+         'mkf': cmd_mkf, 'rm': cmd_rm, 'empf': cmd_empf, 'ln': cmd_ln, 'cp': cmd_cp, 'rcp': cmd_rcp,
+         'apd': cmd_apd, 'recv': cmd_recv, 'cleanup': cmd_cleanup}[args.cmd](d, args)
         if rc:
             return rc
     except FormatError as e:
