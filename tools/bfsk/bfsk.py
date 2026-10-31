@@ -24,13 +24,20 @@
     ls [-f][-F][-l|-t] [PATH..]  ファイル一覧
     fs [-l] [PATH..]             レコード構成
     stat [PATH..]                ファイルヘッダの詳細
+  書き込み (ファイルヘッダのみ変更):
+    ren PATH NAME                ファイル名の変更
+    chmod [-o#][-g#][-p#][-a#] PATH..   アクセスモード / 属性
+    chtime [-l..][-a..][-m..] PATH..    日時 (年.月.日.時.分.秒)
+    touch PATH..                 更新日時・アクセス日時を現在に
     tp [-r#][-a|-x|-b][-e] PATH  レコード内容 (既定は生データを標準出力へ)
   PATH の各コマンドで -i を付けると PATH の代わりにファイルID を指定できる.
 """
 import argparse
+import datetime
 import fnmatch
 import struct
 import sys
+import time
 import unicodedata
 
 # ブート領域の大きさ (= パーティション先頭からシステムブロックまで) の候補.
@@ -61,10 +68,71 @@ def tron_str(b):
 
 
 def fmt_time(t):
-    import datetime
+    """BTRON 日時 (1985-01-01 GMT からの秒) をローカル時刻で表示 (TZ 環境変数に従う)."""
     if t in (0, 0xFFFFFFFF):
         return '-' if t == 0 else 'none'
-    return datetime.datetime.fromtimestamp(t + EPOCH_1985, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    return datetime.datetime.fromtimestamp(t + EPOCH_1985).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def now_btron():
+    return int(time.time()) - EPOCH_1985
+
+
+def parse_btime(spec):
+    """CLI の日時指定 "年.月.日.時.分.秒" (年は西暦下2桁または4桁, ローカル時刻) → BTRON 日時.
+    "-1" は無効値 (保存期限なし)."""
+    if spec.strip() == '-1':
+        return 0xFFFFFFFF
+    parts = spec.split('.')
+    if len(parts) != 6 or not all(x.isdigit() for x in parts):
+        raise FormatError('日時は 年.月.日.時.分.秒 で指定してください: %s' % spec)
+    y, mo, d, h, mi, se = (int(x) for x in parts)
+    if y < 100:
+        y += 1900 if y >= 85 else 2000
+    try:
+        t = int(datetime.datetime(y, mo, d, h, mi, se).timestamp()) - EPOCH_1985
+    except (ValueError, OverflowError) as e:
+        raise FormatError('日時が不正です: %s (%s)' % (spec, e))
+    if not 0 <= t < 0xFFFFFFFF:
+        raise FormatError('日時が範囲外です: %s' % spec)
+    return t
+
+
+# 半角 ASCII → TRON コード (JIS X 0208) にない文字の置き換え
+_TO_FULL = {' ': '\u3000', '-': '\u2212', '~': '\u301c', '\\': '\uff3c', '"': '\u201d', "'": '\u2019', '`': '\u2018'}
+
+
+def tron_encode(name, maxchars=20):
+    """文字列を TRON コード (2 バイト LE 固定長) の 40 バイトに変換.
+    半角英数記号は全角にする (実イメージのファイル名はすべて全角)."""
+    codes = []
+    for ch in name:
+        if ch in _TO_FULL:
+            ch = _TO_FULL[ch]
+        elif 0x21 <= ord(ch) <= 0x7E:
+            ch = chr(ord(ch) + 0xFEE0)
+        try:
+            b = ch.encode('euc-jp')
+        except UnicodeEncodeError:
+            raise FormatError('TRON コードに変換できない文字があります: %r' % ch)
+        if len(b) != 2 or b[0] < 0xA1:
+            raise FormatError('TRON コード (JIS X 0208) にない文字です: %r' % ch)
+        codes.append(((b[0] & 0x7F) << 8) | (b[1] & 0x7F))
+    if not codes:
+        raise FormatError('名前が空です')
+    if len(codes) > maxchars:
+        raise FormatError('名前は %d 文字までです (%d 文字)' % (maxchars, len(codes)))
+    return struct.pack('<%dH' % len(codes), *codes).ljust(maxchars * 2, b'\0')
+
+
+def short_name(name40):
+    """ファイル短縮名 (4.2.4): 2 文字ずつ 32 ビットにまとめ、XOR と右 1 ビット回転."""
+    ch = struct.unpack('<20H', name40)
+    s = 0
+    for k in range(10):
+        s ^= (ch[2 * k] << 16) | ch[2 * k + 1]
+        s = ((s >> 1) | (s << 31)) & 0xFFFFFFFF
+    return s
 
 
 def norm_name(name):
@@ -96,6 +164,12 @@ class RawImage:
         d = self.f.read(n)
         return d + b'\0' * (n - len(d))      # 切り詰められたイメージ対策
 
+    def write(self, off, data):
+        if off + len(data) > self.size:
+            raise FormatError('イメージの範囲外への書き込みです (0x%x)' % off)
+        self.f.seek(off)
+        self.f.write(data)
+
 
 class _BlockMappedImage:
     """固定長ブロック単位でファイル内位置へ対応付ける形式の共通処理."""
@@ -115,6 +189,19 @@ class _BlockMappedImage:
             off += k
             n -= k
         return bytes(out)
+
+    def write(self, off, data):
+        """割り当て済みの領域にだけ上書きする (未割り当て領域への書き込みは未対応)."""
+        pos = 0
+        while pos < len(data):
+            idx, inner = divmod(off + pos, self.bsize)
+            k = min(len(data) - pos, self.bsize - inner)
+            fpos = self._lookup(idx)
+            if fpos is None:
+                raise FormatError('%s の未割り当て領域への書き込みには未対応です (0x%x)' % (self.kind, off + pos))
+            self.f.seek(fpos + inner)
+            self.f.write(data[pos:pos + k])
+            pos += k
 
 
 class VmdkSparseImage(_BlockMappedImage):
@@ -187,9 +274,9 @@ class VdiImage(_BlockMappedImage):
         return self.off_data + v * self.bsize
 
 
-def open_image(path):
+def open_image(path, writable=False):
     """ファイル内容から形式を自動判別して開く."""
-    f = open(path, 'rb')
+    f = open(path, 'r+b' if writable else 'rb')
     head = f.read(0x50)
     if head[:4] == b'KDMV':
         return VmdkSparseImage(f)
@@ -208,8 +295,9 @@ def open_image(path):
 
 
 class Disk:
-    def __init__(self, path, part=None, fsname=None):
-        self.img = open_image(path)
+    def __init__(self, path, part=None, fsname=None, writable=False):
+        self.img = open_image(path, writable)
+        self.writable = writable
         found = self._find_partitions(part)
         if not found:
             raise FormatError('BTRON ファイルシステムが見つかりません')
@@ -278,6 +366,14 @@ class Disk:
             raise FormatError('パーティション %d に BTRON ファイルシステムがありません' % part)
         return out
 
+    def write(self, off, data):
+        if not self.writable:
+            raise FormatError('読み取り専用で開いています')
+        self.img.write(off, data)
+
+    def set_short_name(self, fid, value):
+        self.write(self.block_offset(self.fnmt_blk) + fid * 4, struct.pack('<I', value))
+
     def block_offset(self, n):
         if n == 0:
             return self.base
@@ -303,7 +399,8 @@ class Disk:
 class BFile:
     def __init__(self, disk, fid, blk, ref):
         self.disk, self.fid, self.blk, self.ref = disk, fid, blk, ref
-        self.hblock = disk.read_block(blk)
+        self._recs = None
+        self.hblock = bytearray(disk.read_block(blk))
         h = self.hblock[:192]
         if struct.unpack_from('<I', h, 0)[0] != FH_START or struct.unpack_from('<I', h, 188)[0] != FH_END:
             raise FormatError('ブロック %d にファイルヘッダがありません' % blk)
@@ -322,6 +419,21 @@ class BFile:
             self.ridxofs = struct.unpack_from('<H', h, 176)[0]
             if not (192 + 16 <= self.ridxofs <= disk.blksz - 16) or self.ridxofs % 16:
                 raise FormatError('レコードインデックス開始位置が不正です (%d)' % self.ridxofs)
+
+    @property
+    def owner_mode(self):
+        return self.attr & 0x7                     # RWE
+
+    @property
+    def acc_levels(self):
+        return struct.unpack_from('<2H', self.hblock, 64)   # (グループ, 一般)
+
+    def update_header(self, fields):
+        """ファイルヘッダのフィールドを書き換えて保存する. fields: {offset: (fmt, value)}."""
+        for off, (fmt, val) in fields.items():
+            struct.pack_into(fmt, self.hblock, off, *(val if isinstance(val, tuple) else (val,)))
+        self.disk.write(self.disk.block_offset(self.blk), bytes(self.hblock[:192]))
+        self.__init__(self.disk, self.fid, self.blk, self.ref)   # 読み直し
 
     def fragments(self):
         """フラグメントテーブル (192 から ridxofs まで) を返す: [(size, block, offset)]."""
@@ -664,10 +776,92 @@ def cmd_stat(d, args):
         print('created   : %s' % fmt_time(f.t_gen))
         print('accessed  : %s' % fmt_time(f.t_acc))
         print('updated   : %s' % fmt_time(f.t_upd))
+        g, p = f.acc_levels
+        print('mode      : owner %d  group 0x%03x  public 0x%03x  attr 0x%03x' % (
+            f.owner_mode, g & 0xFFF, p & 0xFFF, f.attr))
+        print('limit     : %s' % fmt_time(f.t_keep))
         print('index ofs : %d' % f.ridxofs)
         print('fragments : %s' % (' '.join('%d@%d+%d' % fr for fr in f.fragments()) or '-'))
         if f.hdr_fid != f.fid:
             print('warning: ヘッダ内ファイルID %d が一致しません' % f.hdr_fid, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# 書き込みコマンド (ファイルヘッダのみ変更)
+# ---------------------------------------------------------------------------
+H_TYPE, H_GRPACC, H_PUBACC, H_LTIME, H_ATIME, H_MTIME, H_NAME = 4, 64, 66, 92, 96, 100, 108
+
+
+def one_target(r, args, what):
+    t = r.targets(args)
+    if len(t) != 1:
+        raise FormatError('%s: ファイルを 1 つだけ指定してください (%d 件一致)' % (what, len(t)))
+    return t[0]
+
+
+def cmd_ren(d, args):
+    r = Resolver(d)
+    args.paths = [args.path]
+    tpath, f = one_target(r, args, 'ren')
+    if f.fid == 0:
+        raise FormatError('ren: ルートファイル (ファイルシステム名) の変更には未対応です')
+    name40 = tron_encode(args.name)
+    f.update_header({H_NAME: ('40s', name40), H_ATIME: ('<I', now_btron())})
+    d.set_short_name(f.fid, short_name(name40))
+    if args.verbose:
+        print('%s -> %s' % (tpath, f.name))
+
+
+def cmd_chmod(d, args):
+    r = Resolver(d)
+    targets = r.targets(args)
+    change = any(v is not None for v in (args.owner, args.group, args.public, args.attr))
+    if args.ngroup is not None:
+        raise FormatError('chmod: -n (所有グループ) には未対応です')
+    for tpath, f in targets:
+        if change:
+            ftype = (f.ftype << 12) | f.attr
+            if args.owner is not None:
+                if not 0 <= args.owner <= 7:
+                    raise FormatError('chmod: -o は 0〜7 です')
+                ftype = (ftype & ~0x7) | args.owner
+            if args.attr is not None:
+                bit, on = {1: (0x10, True), 2: (0x10, False), 3: (0x20, True), 4: (0x20, False)}.get(args.attr, (None, None))
+                if bit is None:
+                    raise FormatError('chmod: -a は 1〜4 です')
+                ftype = (ftype | bit) if on else (ftype & ~bit)
+            fields = {H_TYPE: ('<H', ftype), H_ATIME: ('<I', now_btron())}
+            for opt, off in ((args.group, H_GRPACC), (args.public, H_PUBACC)):
+                if opt is not None:
+                    if not 0 <= opt <= 0xFFF:
+                        raise FormatError('chmod: -g / -p は 0x000〜0xFFF です')
+                    fields[off] = ('<H', opt)
+            f.update_header(fields)
+        g, p = f.acc_levels
+        m = f.owner_mode
+        print('%s  owner=%s%s%s(%d) group=0x%03x public=0x%03x attr=%s%s' % (
+            tpath, 'R' if m & 4 else '-', 'W' if m & 2 else '-', 'E' if m & 1 else '-', m, g & 0xFFF,
+            p & 0xFFF, 'R' if f.attr & 0x10 else '-', 'P' if f.attr & 0x20 else '-'))
+
+
+def cmd_chtime(d, args):
+    r = Resolver(d)
+    fields = {}
+    for spec, off in ((args.ltime, H_LTIME), (args.atime, H_ATIME), (args.mtime, H_MTIME)):
+        if spec is not None:
+            fields[off] = ('<I', parse_btime(spec))
+    for tpath, f in r.targets(args):
+        if fields:
+            f.update_header(fields)
+        print('%s  limit=%s access=%s modify=%s' % (tpath, fmt_time(f.t_keep), fmt_time(f.t_acc),
+                                                    fmt_time(f.t_upd)))
+
+
+def cmd_touch(d, args):
+    r = Resolver(d)
+    t = now_btron()
+    for tpath, f in r.targets(args):
+        f.update_header({H_ATIME: ('<I', t), H_MTIME: ('<I', t)})
 
 
 def hexdump(data, half, out):
@@ -745,10 +939,32 @@ def main():
     m.add_argument('-a', dest='mode', action='store_const', const='a', help='EUC 文字列として表示')
     m.add_argument('-x', dest='mode', action='store_const', const='x', help='16 進ダンプ (ハーフワード)')
     m.add_argument('-b', dest='mode', action='store_const', const='b', help='16 進ダンプ (バイト)')
+    p = sub.add_parser('ren', help='ファイル名の変更 (書き込み)')
+    p.add_argument('-i', '--fid', action='store_true', help='PATH の代わりにファイルID で指定')
+    p.add_argument('-v', dest='verbose', action='store_true', help='変更結果を表示')
+    p.add_argument('path', metavar='PATH')
+    p.add_argument('name', metavar='NAME')
+    num = lambda x: int(x, 0)
+    p = path_cmd('chmod', 'アクセスモード / 属性の表示・変更 (書き込み)', nargs='+')
+    p.add_argument('-o', dest='owner', type=num, help='所有者アクセスモード 0〜7 (RWE)')
+    p.add_argument('-g', dest='group', type=num, help='グループアクセスレベル 0x0RWE')
+    p.add_argument('-p', dest='public', type=num, help='一般アクセスレベル 0x0RWE')
+    p.add_argument('-n', dest='ngroup', type=num, help='所有グループ (未対応)')
+    p.add_argument('-a', dest='attr', type=num, help='1/2: 書込不可 セット/リセット, 3/4: 削除不可 セット/リセット')
+    p = path_cmd('chtime', '日時の表示・設定 (書き込み)', nargs='+')
+    p.add_argument('-l', dest='ltime', metavar='Y.M.D.h.m.s', help='保存期限 (-1 で無効)')
+    p.add_argument('-a', dest='atime', metavar='Y.M.D.h.m.s', help='最新アクセス日時')
+    p.add_argument('-m', dest='mtime', metavar='Y.M.D.h.m.s', help='最新更新日時')
+    path_cmd('touch', '更新日時・アクセス日時を現在に (書き込み)', nargs='+')
     args = ap.parse_args()
+    writes = {'ren', 'touch'} | ({'chmod'} if args.cmd == 'chmod' and any(
+        getattr(args, k) is not None for k in ('owner', 'group', 'public', 'attr')) else set()) | (
+        {'chtime'} if args.cmd == 'chtime' and any(
+            getattr(args, k) is not None for k in ('ltime', 'atime', 'mtime')) else set())
     try:
-        d = Disk(args.image, args.partition, args.fsname)
-        {'info': cmd_info, 'df': cmd_df, 'ls': cmd_ls, 'fs': cmd_fs, 'stat': cmd_stat, 'tp': cmd_tp}[args.cmd](d, args)
+        d = Disk(args.image, args.partition, args.fsname, writable=args.cmd in writes)
+        {'info': cmd_info, 'df': cmd_df, 'ls': cmd_ls, 'fs': cmd_fs, 'stat': cmd_stat, 'tp': cmd_tp,
+         'ren': cmd_ren, 'chmod': cmd_chmod, 'chtime': cmd_chtime, 'touch': cmd_touch}[args.cmd](d, args)
     except FormatError as e:
         print('error: %s' % e, file=sys.stderr)
         return 1
