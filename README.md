@@ -64,6 +64,7 @@ chmod +x run-btron3sdk.sh
 ```
 Dockerfile          コンテナビルド定義
 run-btron3sdk.sh    コンテナ起動スクリプト
+tools/bfsk/         BTRON ディスクイメージ操作ツール (詳細は tools/bfsk/README.md)
 ```
 
 ## ビルド済みサンプル
