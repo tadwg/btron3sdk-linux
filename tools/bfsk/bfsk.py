@@ -1143,7 +1143,7 @@ class FileManager:
             new = {'kind': 'data', 'type': rtype, 'subtype': subtype, 'offset': off,
                    'size': len(data), 'extents': ext}
         recs.insert(recno, new)
-        self._store(f, recs, touched={b for b, _ in new['extents']})
+        self._store(f, recs, touched={b for b0, c in new['extents'] for b in range(b0, b0 + c)})
         return recno
 
     def apd_rec(self, fid, rtype, subtype, data=b'', link=None):
