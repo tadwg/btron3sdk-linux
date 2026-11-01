@@ -38,7 +38,7 @@ printf 'replaced\n' | $B apd -d 0.1 /WORK/新規A - && $B tp /WORK/新規A | gre
 chk "apd stdin"
 echo "+ (エラーになるはず) 空の標準入力"
 if $B apd -d 0.1 /WORK/新規A - < /dev/null 2>/dev/null; then echo "  UNEXPECTED SUCCESS"; fail=1; fi
-$B fs /WORK/新規A | grep -q '^  0: 31' && echo "  unchanged ok" || { echo "  CHANGED"; fail=1; }
+$B fs /WORK/新規A | grep -q '^ 0:  31' && echo "  unchanged ok" || { echo "  CHANGED"; fail=1; }
 run ln /WORK/h.txt /WORK/新規A
 run ln -p 0 -a 0x8000.0.0.0.0 /SBOOT /WORK/B
 run cp /WORK/新規A /WORK/B
