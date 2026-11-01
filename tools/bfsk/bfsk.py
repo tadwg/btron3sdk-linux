@@ -833,9 +833,9 @@ def cmd_ls(d, args):
             entries = [(disp, fid, attrs) for disp, _, _, fid, attrs, _ in r.children(tf)]
             if len(targets) > 1:
                 print('%s:' % tpath)
-        if args.long and (k == 0 or not args.self_):
+        if args.long and k == 0:               # 見出しは最初の 1 回だけ (CLI と同じ)
             print('ATYPE ATR   NREC NREF  SIZE   BLK  MTIME            NAME')
-        elif args.time and (k == 0 or not args.self_):
+        elif args.time and k == 0:
             print('     CTIME            MTIME            ATIME       NAME')
         col = 0
         for disp, fid, lattrs in entries:
@@ -2049,8 +2049,9 @@ def hexdump(data, half, out):
     for off in range(0, len(data), 16):
         chunk = data[off:off + 16]
         if half:
-            if len(chunk) % 2:
-                chunk += b'\0'
+            chunk = chunk[:len(chunk) & ~1]      # 端数の 1 バイトは表示しない (CLI と同じ)
+            if not chunk:
+                break
             cells = ' '.join('%04x' % struct.unpack_from('<H', chunk, k)[0] for k in range(0, len(chunk), 2))
         else:
             cells = ' '.join('%02x' % b for b in chunk)
