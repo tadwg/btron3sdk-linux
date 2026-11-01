@@ -2,68 +2,24 @@
 
 > このリポジトリのツールとドライバは、[Claude](https://www.anthropic.com/claude) からこれらのツールを呼び出して開発しました ([Claude (AI エージェント) からの開発](#claude-ai-エージェント-からの開発))。
 
-超漢字V 向けのクロスコンパイル環境を Linux 上の Podman (または Docker) コンテナで構築します。
+超漢字V (BTRON3) のプログラムを Linux 上で開発するための環境とツールです。
 
-`docker build` または `podman build` 一発で以下まで自動的に行います:
+- [`sdk/`](sdk/README.md): 超漢字V のクロス開発環境 (brightv) を Podman / Docker コンテナで構築する
+- [`tools/bfsk/`](tools/bfsk/README.md): 超漢字V のディスクイメージを Linux から読み書きする
+- [`tools/qemu/`](tools/qemu/README.md): QEMU で超漢字V を起動し、コマンドラインから操作する
+- [`driver/`](#ディレクトリ構成): QEMU 用のドライバなど
 
-- 超漢字クロス開発環境アーカイブ (brightv) のダウンロード
-- 32bit ELF バイナリ実行に必要な glibc.i686 等のインストール
-- EUC-JP コメント対応 cpp ラッパーのパッチ適用
-- `driver/etc/makerules` の余分な `endif` 削除パッチ
-- アプリケーションサンプル全4本のビルド (`sample1`, `sample2`, `tagsamp1`, `tagsamp2`)
-- デバイスドライバサンプル (`rsdrv`) のビルド
-
-## 必要なもの
-
-- Podman または Docker が動作する Linux 環境
-- インターネット接続（ビルド時に chokanji.com からアーカイブを取得）
-
-## ビルド
+開発環境のコンテナは次のコマンドで作れます (詳細は [sdk/README.md](sdk/README.md))。
 
 ```bash
 podman build -t btron3sdk:latest sdk
-# または
-docker build -t btron3sdk:latest sdk
-```
-
-ビルドには数分かかります（アーカイブのダウンロード含む）。
-
-## 使い方
-
-### 開発シェルに入る
-
-```bash
-podman run --rm -it -v $PWD:/workspace:z btron3sdk:latest
-```
-
-コンテナ内に入ると環境変数が自動設定されます:
-
-```bash
-echo $BD        # /usr/local/brightv
-echo $GNUi386   # /usr/local/brightv/tool/gnu/i386-unknown-gnu
-```
-
-### プロジェクトをビルドする
-
-```bash
-# コンテナ内で
-cd /workspace/mydriver/pcat
-make BD=$BD GNUs=$GNUs GNU_BD=$GNU_BD GNUi386=$GNUi386
-```
-
-### 起動スクリプトを使う
-
-```bash
-sdk/run-btron3sdk.sh            # 開発シェル
-sdk/run-btron3sdk.sh gterm      # gterm デバッグ接続（TCP 9999）
 ```
 
 ## ディレクトリ構成
 
 | パス | 内容 |
 |------|------|
-| `sdk/Dockerfile` | クロス開発環境 (btron3sdk) のコンテナ定義 |
-| `sdk/run-btron3sdk.sh` | 開発環境コンテナの起動スクリプト (カレントディレクトリを `/workspace` にマウント) |
+| [`sdk/`](sdk/README.md) | クロス開発環境 (btron3sdk) のコンテナ定義 `Dockerfile` と起動スクリプト `run-btron3sdk.sh` |
 | [`tools/bfsk/`](tools/bfsk/README.md) | BTRON ディスクイメージ (raw / VMDK / VDI) を Linux から読み書きする Python ツール。超漢字の CLI に近いコマンド (`ls` `tp` `recv` `apd` `rm` `check` など) で、ファイルの取り込み・取り出しや `STARTUP.CMD` の編集ができる |
 | [`tools/qemu/`](tools/qemu/README.md) | QEMU で超漢字V を起動するコンテナ (`run-qemu.sh`) と、操作ツール `btctl` (シリアルの CLI でコマンド実行、画面のスクリーンショット、マウス操作、キー入力) |
 | [`driver/qemukbpd/`](driver/qemukbpd/README.md) | QEMU 用 キーボード + 絶対座標マウスドライバ (lowkbpd の代わり。ドラッグ可) |
@@ -122,18 +78,6 @@ Claude Code のような AI エージェントがソースの変更から動作�
 KVM が使えない環境でも動きます (起動に 30〜50 秒ほど)。QEMU はホストに直接入れず、
 `tools/qemu/Containerfile` のコンテナで動かすことを前提にしています。
 
-## ビルド済みサンプル
-
-コンテナ内の以下のパスにビルド済みバイナリがあります:
-
-| パス | 内容 |
-|------|------|
-| `/usr/local/brightv/appl/sample1/pcat/sample.bz` | アプリサンプル1 |
-| `/usr/local/brightv/appl/sample2/pcat/sched.bz` | アプリサンプル2 |
-| `/usr/local/brightv/appl/tagsamp1/pcat/tagsamp1.bz` | TADタグサンプル1 |
-| `/usr/local/brightv/appl/tagsamp2/pcat/tagsamp2.bz` | TADタグサンプル2 |
-| `/usr/local/brightv/driver/sample/pcat/rsdrv` | RSドライバサンプル |
-
 ## 参考資料
 
 - [超漢字 開発者向けページ](https://www.chokanji.com/developer/)
@@ -142,7 +86,5 @@ KVM が使えない環境でも動きます (起動に 30〜50 秒ほど)。QEMU
 
 ## ライセンス
 
-このリポジトリの `sdk/` の Dockerfile および起動スクリプトは MIT ライセンスです。
-
-ダウンロードされる brightv アーカイブは Personal Media Corporation の著作物であり、
-使用条件については [超漢字開発者向けページ](https://www.chokanji.com/developer/) をご確認ください。
+`sdk/` の Dockerfile および起動スクリプトは MIT ライセンスです。
+ダウンロードされる brightv アーカイブの使用条件は [sdk/README.md](sdk/README.md#ライセンス) を参照してください。
