@@ -17,4 +17,5 @@
 #include <bsys/cons_io.h>
 #include <util/debug.h>
 #include <tstring.h>
+#include <bstring.h>
 #endif

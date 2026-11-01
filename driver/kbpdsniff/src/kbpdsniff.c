@@ -98,7 +98,7 @@ static ERR copy_out(DevReq *req, VP src, W size, W *alen)
     ERR er;
     *alen = size;
     if (req->datacnt == 0) return ER_OK;           /* サイズの問い合わせ */
-    if (req->datacnt < size) return toERR(EC_PAR, ED_DATACNT);
+    if (req->datacnt < size) return ER_PAR;
     if (req->cmd.adcnv) {
         er = SetTaskSpace(req->taskid);
         if (er != ER_OK) return er;
