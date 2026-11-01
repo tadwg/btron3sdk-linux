@@ -66,6 +66,7 @@ Dockerfile          コンテナビルド定義
 run-btron3sdk.sh    コンテナ起動スクリプト
 tools/bfsk/         BTRON ディスクイメージ操作ツール (詳細は tools/bfsk/README.md)
 tools/qemu/         QEMU で超漢字V を起動・操作するツール (詳細は tools/qemu/README.md)
+.github/workflows/  ドライバの自動ビルド (GitHub Actions)
 driver/qemumouse/   QEMU 用 絶対座標マウスドライバ (詳細は driver/qemumouse/README.md)
 ```
 
@@ -83,6 +84,12 @@ tools/qemu/run-qemu.sh disk.img                                      # 起動
 tools/qemu/btctl mice                                                # 絶対座標モードか確認
 tools/qemu/run-qemu.sh stop
 ```
+
+QEMU で動かすときの注意点 (ネットワークアダプタ、DEBUGMODE、時計、sync など) は
+[tools/qemu/README.md](tools/qemu/README.md) にまとめています。
+
+`driver/*/src` の変更を main に push すると、GitHub Actions (`.github/workflows/build-drivers.yml`) が
+同じ開発環境でビルドし、`driver/*/bin/` を更新してコミットします。
 
 ## ビルド済みサンプル
 

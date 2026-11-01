@@ -9,6 +9,7 @@
 #   QEMU_IMAGE  コンテナイメージ (既定 btron-qemu:latest, tools/qemu/Containerfile)
 #   QEMU_NIC    NIC のモデル (既定 pcnet. 体験版はネットワークアダプタが必須)
 #   QEMU_MEM    メモリ MB (既定 256)
+#   QEMU_SNAPSHOT=1  イメージに書き込まない (変更は QEMU 終了時に捨てる)
 #
 # IMAGE と同じディレクトリに serial.sock / serial.log / qmp.sock を作る.
 # 操作は tools/qemu/btctl (シリアルの CLI、画面取得、マウス) を使う.
@@ -31,6 +32,8 @@ case "$FILE" in
   *.vdi)  FMT=vdi ;;
   *)      FMT=raw ;;
 esac
+SNAP=
+[ -n "$QEMU_SNAPSHOT" ] && SNAP=-snapshot
 podman rm -f "$NAME" >/dev/null 2>&1 || true
 rm -f "$DIR/serial.sock" "$DIR/qmp.sock" "$DIR/serial.log"
 podman run -d --name "$NAME" --network none --memory 700m \
@@ -42,5 +45,5 @@ podman run -d --name "$NAME" --network none --memory 700m \
     -chardev socket,id=s0,path=/w/serial.sock,server=on,wait=off,logfile=/w/serial.log \
     -serial chardev:s0 \
     -qmp unix:/w/qmp.sock,server=on,wait=off \
-    -rtc base=localtime -no-reboot >/dev/null
+    -rtc base=localtime -no-reboot $SNAP >/dev/null
 echo "started $NAME ($FILE). serial log: $DIR/serial.log"
