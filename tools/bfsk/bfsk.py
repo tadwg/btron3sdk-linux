@@ -1763,13 +1763,15 @@ def cmd_ln(d, args):
         if not srcs:
             raise FormatError('ln: リンク先パスとリンクするファイルを指定してください')
         _, df = resolve_one(s.r, dest, 'ln')
-        attrs = tuple(cli_int(x) for x in args.attrs.split('.')) if args.attrs else (0, 0, 0, 0, 0)
-        if len(attrs) != 5:
+        attrs = tuple(cli_int(x) for x in args.attrs.split('.')) if args.attrs else None
+        if attrs is not None and len(attrs) != 5:
             raise FormatError('ln: -a は 属性1.属性2.属性3.属性4.属性5 です')
         pos = args.pos
         for spec in srcs:
-            for _, f in s.r.resolve(spec):
-                s.fm.ins_rec(df.fid, pos, 0, 0, link=(f.fid, attrs))
+            for p, f in s.r.resolve(spec):
+                # -a が無ければ、たどったリンクの属性を引き継ぐ (CLI と同じ). ファイル ID 指定なら 0
+                la = attrs or s.r.link_attrs.get(p) or (0, 0, 0, 0, 0)
+                s.fm.ins_rec(df.fid, pos, 0, 0, link=(f.fid, la))
                 if pos is not None:
                     pos += 1
     return run_session(d, body)
