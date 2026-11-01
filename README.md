@@ -67,19 +67,22 @@ run-btron3sdk.sh    コンテナ起動スクリプト
 tools/bfsk/         BTRON ディスクイメージ操作ツール (詳細は tools/bfsk/README.md)
 tools/qemu/         QEMU で超漢字V を起動・操作するツール (詳細は tools/qemu/README.md)
 .github/workflows/  ドライバの自動ビルド (GitHub Actions)
-driver/qemumouse/   QEMU 用 絶対座標マウスドライバ (詳細は driver/qemumouse/README.md)
+driver/qemukbpd/    QEMU 用 キーボード + 絶対座標マウスドライバ (lowkbpd の代わり)
+driver/qemumouse/   QEMU 用 絶対座標マウスドライバ (lowkbpd と併用. ドラッグ不可のため qemukbpd を推奨)
+driver/kbprobe/     調査用: kbpd のキーマップを出力 (lowkbpd のキートップコード表)
+driver/kbpdsniff/   調査用: ダミーの kbpd (実 IO ドライバからのメッセージを出力)
 ```
 
 ## ビルドからディスクイメージへの書き込み・実行まで
 
 bfsk と QEMU を使うと、超漢字V のプログラムを「ビルド → イメージへの書き込み → 起動 → 確認」まで
-コマンドラインだけで行えます (例: QEMU 用マウスドライバ)。
+コマンドラインだけで行えます (例: QEMU 用キーボード・マウスドライバ)。
 
 ```bash
 podman build -t btron3sdk:latest .                                   # 開発環境
 podman build -t btron-qemu:latest -f tools/qemu/Containerfile tools/qemu
-podman run --rm -v $PWD:/workspace:Z btron3sdk:latest bash /workspace/driver/qemumouse/build.sh
-driver/qemumouse/install.sh disk.img debug                           # bfsk でイメージに組み込み
+podman run --rm -v $PWD:/workspace:Z btron3sdk:latest bash /workspace/driver/qemukbpd/build.sh
+driver/qemukbpd/install.sh disk.img debug                            # bfsk でイメージに組み込み
 tools/qemu/run-qemu.sh disk.img                                      # 起動
 tools/qemu/btctl mice                                                # 絶対座標モードか確認
 tools/qemu/run-qemu.sh stop

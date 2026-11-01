@@ -24,7 +24,7 @@ $B tp /SYS/DEVCONF | sed 's/^DEBUGMODE .*/DEBUGMODE 1/' | $B apd -d 0.1 /SYS/DEV
 tools/qemu/run-qemu.sh disk.img        # 起動 (バックグラウンド, 外部ネットワーク無し)
 tools/qemu/btctl cli 'ls -l /SYS/WORK' # シリアルの CLI でコマンド実行
 tools/qemu/btctl screen shot.png       # 画面を disk.img と同じディレクトリに保存
-tools/qemu/btctl click 170 129 -2      # 画面座標 (170,129) をダブルクリック (qemumouse が必要)
+tools/qemu/btctl click 170 129 -2      # 画面座標 (170,129) をダブルクリック (qemukbpd が必要)
 tools/qemu/btctl mice                  # マウスの状態 ("vmmouse (absolute)" なら絶対座標)
 tools/qemu/run-qemu.sh stop            # CLI で sync してから停止
 ```
@@ -76,9 +76,14 @@ QEMU 9.0 (KVM なし) で、超漢字V の体験版イメージ (VMware 用の 4
 - ファイル名は全角英数で保存されていますが、CLI は半角で表示し、半角で入力できます
 - ウィンドウで開いている実身を CLI で変更しても、ウィンドウには反映されません (CLI の仕様)
 
-### マウス
+### キーボードとマウス
 
-- `qemumouse` を組み込むと `btctl mice` が `vmmouse (absolute)` になり、`btctl move` / `click` で
+- `driver/qemukbpd` (lowkbpd の代わり) を組み込むと、キーボードは i8042 から、マウスは vmmouse から絶対座標で
+  入力され、ドラッグも含めて操作できます。`driver/qemumouse` は lowkbpd と一緒に使うため、QEMU が vmmouse の
+  イベントごとに作るダミーの PS/2 パケットのせいでドラッグができません
+- 起動中の lowkbpd を `unlspg` で外すとカーネルが停止します (割り込みハンドラが残るため)。
+  lowkbpd は `STARTUP.CMD` で読み込まないようにしてください
+- `qemukbpd` (または `qemumouse`) を組み込むと `btctl mice` が `vmmouse (absolute)` になり、`btctl move` / `click` で
   画面座標を指定して操作できます (QEMU へは 0〜32767、ドライバへは 0〜65535 の値で渡ります)
-- `qemumouse` が無いときは PS/2 マウス (相対座標) だけで、`btctl move` / `click` は
+- `qemukbpd` / `qemumouse` が無いときは PS/2 マウス (相対座標) だけで、`btctl move` / `click` は
   「Input handler not found for event type abs」というエラーになります
