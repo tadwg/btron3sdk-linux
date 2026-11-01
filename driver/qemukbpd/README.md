@@ -45,6 +45,35 @@ driver/qemukbpd/install.sh disk.img debug      # デバッグ版 (DEBUGMODE 1 �
 `lowkbpd`・`qemumouse`・`vmwdrv` をコメントアウトします。GitHub では main への push で GitHub Actions が
 `bin/` を更新します。
 
+### bfsk で手作業で組み込む
+
+`install.sh` を使わずに、`tools/bfsk/bfsk.py` で同じことができます (仮想マシンは止めておくこと)。
+
+```bash
+BFSK="python3 tools/bfsk/bfsk.py disk.img"
+
+# 1. ドライバを /SYS/qemukbpd として取り込む
+#    -d: 同じ名前のファイルがあれば置き換える / -a 3: アプリケーションタイプ / -t: レコードタイプ.サブタイプ
+$BFSK recv -d -a 3 -t 31.0x4530 -N qemukbpd driver/qemukbpd/bin/qemukbpd /SYS
+
+# 2. STARTUP.CMD を取り出して編集する
+$BFSK tp /SYS/STARTUP.CMD > startup.txt
+#    - "kerext lowkbpd ..." "kerext qemumouse ..." "kerext vmwdrv ..." の行頭に * を付けてコメントにする
+#    - "kerext kbpd ..." の次の行に次の 1 行を追加する (区切りはタブ)
+#        kerext	qemukbpd	!28
+
+# 3. 編集した内容で STARTUP.CMD のテキストレコードを置き換える (- は標準入力)
+$BFSK apd -d 0.1 /SYS/STARTUP.CMD - < startup.txt
+
+# 4. 確かめる
+$BFSK tp /SYS/STARTUP.CMD | grep kerext
+$BFSK stat /SYS/qemukbpd
+$BFSK check
+```
+
+元に戻すときは、`STARTUP.CMD` の `lowkbpd` (と必要なら `vmwdrv`) の行頭の `*` を外し、
+`qemukbpd` の行を削除するかコメントにします。ドライバのファイルは `$BFSK rm /SYS/qemukbpd` で消せます。
+
 **QEMU 専用です。** 実機や VMware / VirtualBox では lowkbpd を使ってください (i8042 や vmmouse の動作を QEMU 前提にしています)。
 
 ## エラーコード

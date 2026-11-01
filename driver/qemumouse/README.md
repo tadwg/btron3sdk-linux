@@ -65,6 +65,14 @@ kerext	qemumouse	!23
 ```
 
 手作業で導入する場合は、`qemumouse` を `/SYS` に置き、上の行を `STARTUP.CMD` に追加してください。
+bfsk を使うと次のようになります (手順の説明は `driver/qemukbpd/README.md` を参照)。
+
+```bash
+BFSK="python3 tools/bfsk/bfsk.py disk.img"
+$BFSK recv -d -a 3 -t 31.0x4530 -N qemumouse driver/qemumouse/bin/qemumouse /SYS
+$BFSK tp /SYS/STARTUP.CMD > startup.txt     # 編集: vmwdrv をコメントにし、kbpd の次に上の行を追加
+$BFSK apd -d 0.1 /SYS/STARTUP.CMD - < startup.txt
+```
 
 ## エラーコード
 
