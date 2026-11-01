@@ -1279,6 +1279,15 @@ class FileManager:
         self._store(f, recs, touched={b for b0, c in new['extents'] for b in range(b0, b0 + c)})
         return recno
 
+    def wri_rec(self, fid, recno, data, subtype=None):
+        """データレコードの内容 (と必要ならサブタイプ) を置き換える. タイプは変えない."""
+        r = self.rec_list(fid)[recno]
+        if r['kind'] != 'data':
+            raise FormatError('レコード %d はデータレコードではありません' % recno)
+        st = r['subtype'] if subtype is None else subtype
+        self.del_rec(fid, recno)
+        self.ins_rec(fid, recno, r['type'], st, data)
+
     def apd_rec(self, fid, rtype, subtype, data=b'', link=None):
         return self.ins_rec(fid, None, rtype, subtype, data, link)
 
@@ -1983,6 +1992,120 @@ def cmd_cleanup(d, args):
 
 
 # ---------------------------------------------------------------------------
+# アプリケーション登録 (CLI の apreg / apdel)
+#   実機で確認した動作:
+#   - 機能付箋 (タイプ 7) 1 つごとに /$$PROGRAM.BOX の末尾へリンクを追加する.
+#     リンク属性は (0x8000, 0, 付箋 +0x18 のアプリケーション ID 3 語)
+#   - $$PROGRAM.BOX のレコード 0 (タイプ 15) はリンク順に並んだ 32 バイトの分類名の表で、
+#     付箋 +0x3E の分類名を書く. 削除時は後ろを 1 つ詰める (末尾の 1 件は残る)
+#   - -t (小物) のときは付箋レコードを /SYS/USR/小物入れ (無ければ /小物入れ) の末尾にも追加する
+#   - apdel は該当リンクと、同じアプリケーション ID の付箋を小物入れから削除し、
+#     参照されなくなったファイルは削除する
+# ---------------------------------------------------------------------------
+FUSEN_APPL, FUSEN_CLASS = 0x18, 0x3E
+
+
+def _root_child(s, name):
+    try:
+        return resolve_one(s.fresh(), '/' + name, 'apreg')[1]
+    except FormatError:
+        return None
+
+
+def _kobako(s):
+    for p in ('/USR/小物入れ', '/小物入れ'):
+        try:
+            return resolve_one(s.fresh(), p, 'apreg')[1]
+        except FormatError:
+            pass
+    return None
+
+
+def _class_table(s, pb):
+    recs = s.fm.rec_list(pb.fid)
+    if not recs or recs[0]['kind'] != 'data' or recs[0]['type'] != 15:
+        raise FormatError('$$PROGRAM.BOX のレコード 0 が分類名の表 (タイプ 15) ではありません')
+    return bytearray(s.fm.rea_rec(pb.fid, 0))
+
+
+def cmd_apreg(d, args):
+    def body(s):
+        _, f = resolve_one(s.r, args.path, 'apreg')
+        recs = s.fm.rec_list(f.fid)
+        fusens = [s.fm.rea_rec(f.fid, i) for i, r in enumerate(recs) if r['kind'] == 'data' and r['type'] == 7]
+        fsub = [r['subtype'] for r in recs if r['kind'] == 'data' and r['type'] == 7]
+        if not f.apptype & 0x8000:
+            raise FormatError('apreg: アプリケーションタイプが実行可能 (MSB=1) ではありません')
+        if not recs or recs[0]['kind'] != 'data' or recs[0]['type'] != 9:
+            raise FormatError('apreg: 先頭レコードが実行オブジェクトレコード (タイプ 9) ではありません')
+        if not fusens:
+            raise FormatError('apreg: 機能付箋レコード (タイプ 7) がありません')
+        if any(len(x) < FUSEN_CLASS + 2 for x in fusens):
+            raise FormatError('apreg: 機能付箋レコードが短すぎます')
+        pb = _root_child(s, '$$PROGRAM.BOX')
+        if pb is None:
+            raise FormatError('apreg: /$$PROGRAM.BOX がありません')
+        kb = _kobako(s) if args.accessory else None
+        if args.accessory and kb is None:
+            raise FormatError('apreg: 小物入れがありません')
+        table = _class_table(s, pb)
+        for fu in fusens:
+            appl = struct.unpack_from('<3H', fu, FUSEN_APPL)
+            idx = len(s.fm.fnd_lnk(pb.fid))
+            s.fm.apd_rec(pb.fid, 0, 0, link=(f.fid, (0x8000, 0) + appl))
+            cls = fu[FUSEN_CLASS:FUSEN_CLASS + 32]
+            n = 0
+            while n + 1 < len(cls) and cls[n:n + 2] != b'\0\0':
+                n += 2
+            if len(table) < (idx + 1) * 32:
+                table += bytes((idx + 1) * 32 - len(table))
+            table[idx * 32:idx * 32 + 32] = cls[:n].ljust(32, b'\0')
+        s.fm.wri_rec(pb.fid, 0, bytes(table))
+        if kb is not None:
+            for fu, st in zip(fusens, fsub):
+                s.fm.apd_rec(kb.fid, 7, st, fu)
+    return run_session(d, body)
+
+
+def cmd_apdel(d, args):
+    def body(s):
+        try:
+            _, f = resolve_one(s.r, args.path, 'apdel')
+        except FormatError:
+            if args.force:
+                return
+            raise
+        pb = _root_child(s, '$$PROGRAM.BOX')
+        if pb is None:
+            raise FormatError('apdel: /$$PROGRAM.BOX がありません')
+        recs = s.fm.rec_list(f.fid)
+        appls = {struct.unpack_from('<3H', s.fm.rea_rec(f.fid, i), FUSEN_APPL)
+                 for i, r in enumerate(recs) if r['kind'] == 'data' and r['type'] == 7}
+        links = s.fm.fnd_lnk(pb.fid)
+        hits = [(k, recno) for k, (recno, lfid, _) in enumerate(links) if lfid == f.fid]
+        if not hits:
+            raise FormatError('apdel: %s はアプリケーションとして登録されていません' % args.path)
+        table = _class_table(s, pb)
+        for k, recno in reversed(hits):
+            n = len(table) // 32
+            if k < n - 1:
+                table[k * 32:(n - 1) * 32] = table[(k + 1) * 32:n * 32]
+            s.fm.del_rec(pb.fid, recno)
+        s.fm.wri_rec(pb.fid, 0, bytes(table))
+        kb = _kobako(s)
+        if kb is not None:
+            krecs = s.fm.rec_list(kb.fid)
+            for i in reversed(range(len(krecs))):
+                r = krecs[i]
+                if r['kind'] == 'data' and r['type'] == 7 and r['size'] >= FUSEN_APPL + 6 and \
+                        struct.unpack_from('<3H', s.fm.rea_rec(kb.fid, i), FUSEN_APPL) in appls:
+                    s.fm.del_rec(kb.fid, i)
+        if s.fm.refcount(f.fid) == 0:
+            s.fm._delete_file(f.fid, False)
+    return run_session(d, body)
+
+
+# ---------------------------------------------------------------------------
 # 書き込みコマンド (ファイルヘッダのみ変更)
 # ---------------------------------------------------------------------------
 H_TYPE, H_GRPACC, H_PUBACC, H_LTIME, H_ATIME, H_MTIME, H_NAME = 4, 64, 66, 92, 96, 100, 108
@@ -2164,11 +2287,17 @@ def main():
     p.add_argument('-a', dest='atype', type=num, default=0, help='アプリケーションタイプ (既定 0)')
     p.add_argument('-N', dest='name', help='ファイル名 (既定: Linux 側のファイル名)')
     p.add_argument('-v', dest='verbose', action='store_true')
+    p = sub.add_parser('apreg', help='アプリケーション登録 (書き込み)')
+    p.add_argument('-t', dest='accessory', action='store_true', help='「小物」メニューへも登録')
+    p.add_argument('path', metavar='PATH')
+    p = sub.add_parser('apdel', help='アプリケーション登録の削除 (書き込み)')
+    p.add_argument('-f', dest='force', action='store_true', help='PATH が無くてもエラーにしない')
+    p.add_argument('path', metavar='PATH')
     p = sub.add_parser('cleanup', help='ルートから到達できないファイルを削除 (書き込み)')
     p.add_argument('-n', dest='dry_run', action='store_true', help='表示のみ')
     p.add_argument('-v', dest='verbose', action='store_true')
     args = ap.parse_args()
-    writes = {'ren', 'touch', 'mkf', 'rm', 'empf', 'ln', 'cp', 'rcp', 'apd', 'recv'} | (
+    writes = {'ren', 'touch', 'mkf', 'rm', 'empf', 'ln', 'cp', 'rcp', 'apd', 'recv', 'apreg', 'apdel'} | (
         {'cleanup'} if args.cmd == 'cleanup' and not args.dry_run else set()) | ({'chmod'} if args.cmd == 'chmod' and any(
         getattr(args, k) is not None for k in ('owner', 'group', 'public', 'attr')) else set()) | (
         {'chtime'} if args.cmd == 'chtime' and any(
@@ -2178,7 +2307,7 @@ def main():
         rc = {'info': cmd_info, 'df': cmd_df, 'check': cmd_check, 'ls': cmd_ls, 'fs': cmd_fs, 'stat': cmd_stat, 'tp': cmd_tp,
          'ren': cmd_ren, 'chmod': cmd_chmod, 'chtime': cmd_chtime, 'touch': cmd_touch,
          'mkf': cmd_mkf, 'rm': cmd_rm, 'empf': cmd_empf, 'ln': cmd_ln, 'cp': cmd_cp, 'rcp': cmd_rcp,
-         'apd': cmd_apd, 'recv': cmd_recv, 'cleanup': cmd_cleanup}[args.cmd](d, args)
+         'apd': cmd_apd, 'recv': cmd_recv, 'apreg': cmd_apreg, 'apdel': cmd_apdel, 'cleanup': cmd_cleanup}[args.cmd](d, args)
         if rc:
             return rc
     except FormatError as e:
