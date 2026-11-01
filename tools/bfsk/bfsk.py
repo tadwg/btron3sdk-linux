@@ -33,12 +33,13 @@
     chtime [-l..][-a..][-m..] PATH..    日時 (年.月.日.時.分.秒)
     touch PATH..                 更新日時・アクセス日時を現在に
     tp [-r#][-a|-x|-b][-e] PATH  レコード内容 (既定は生データを標準出力へ)
-  PATH の各コマンドで -i を付けると PATH の代わりにファイルID を指定できる.
+  PATH に "/SYS:ファイルID[/...]" と書くとファイル ID で指定できる (例: /SYS:83).
 """
 import argparse
 import datetime
 import fnmatch
 import os
+import re
 import struct
 import sys
 import time
@@ -634,6 +635,9 @@ def cmd_info(d, args):
 #   *          ワイルドカード
 #   全角/半角は区別しない
 # ---------------------------------------------------------------------------
+FID_PATH = re.compile(r'^/SYS:([0-9A-Za-z]+)(?:/|$)')
+
+
 def split_path(path):
     comps, cur, esc = [], [], False
     for ch in path:
@@ -699,9 +703,20 @@ class Resolver:
         return out
 
     def resolve(self, path):
-        """パスに一致する [(表示パス, BFile)] を返す (ワイルドカードで複数あり得る)."""
+        """パスに一致する [(表示パス, BFile)] を返す (ワイルドカードで複数あり得る).
+        "/SYS:ファイルID[/...]" はファイル ID のファイルを起点にする (bfsk 独自の拡張)."""
         results = [([], [0], None, None)]   # (表示名, fid スタック, 最後のリンク属性, (親fid, レコード番号))
-        for toks in split_path(path):
+        comps = split_path(path)
+        m = FID_PATH.match(path)
+        if m:
+            try:
+                fid = cli_int(m.group(1))
+            except ValueError:
+                raise FormatError('%s: ファイル ID の形式が不正です' % path)
+            self.file(fid)
+            results = [(['SYS:%d' % fid], [fid], None, None)]
+            comps = comps[1:]
+        for toks in comps:
             word = ''.join(ch for _, ch in toks)
             nxt = []
             for names, stack, la, lp in results:
@@ -732,18 +747,11 @@ class Resolver:
         return out
 
     def targets(self, args, default='/'):
-        """コマンド引数 (パス or -i 指定時はファイルID) を [(表示名, BFile)] に."""
+        """コマンド引数のパスを [(表示パス, BFile)] に."""
         items = args.paths if getattr(args, 'paths', None) else [default]
         out = []
         for a in items:
-            if args.fid:
-                try:
-                    fid = cli_int(a)
-                except ValueError:
-                    raise FormatError('%s: ファイルID は数値で指定してください' % a)
-                out.append(('#%d' % fid, self.file(fid)))
-            else:
-                out.extend(self.resolve(a))
+            out.extend(self.resolve(a))
         return out
 
 
@@ -1515,9 +1523,7 @@ def split_parent(path):
     return parent, ''.join(ch for _, ch in toks[0])
 
 
-def resolve_one(r, spec, by_fid, what):
-    if by_fid:
-        return '#%s' % spec, r.file(cli_int(spec))
+def resolve_one(r, spec, what):
     t = r.resolve(spec)
     if len(t) != 1:
         raise FormatError('%s: %s に %d 件一致しました (1 件だけ指定してください)' % (what, spec, len(t)))
@@ -1575,7 +1581,7 @@ def cmd_mkf(d, args):
     def body(s):
         for path in args.paths:
             parent, name = split_parent(path)
-            _, pf = resolve_one(s.fresh(), parent, False, 'mkf')
+            _, pf = resolve_one(s.fresh(), parent, 'mkf')
             fid = s.fm.cre_fil(pf.fid, name, args.atype)
             if args.verbose:
                 print('%s (fid %d)' % (path, fid))
@@ -1586,9 +1592,6 @@ def _rm_targets(s, args):
     """削除対象: [(親 fid or None, fid, 表示名)]. 同じ親の中は後ろのレコードから."""
     out = []
     for spec in args.paths:
-        if args.fid:
-            out.append((None, cli_int(spec), None, '#' + spec))
-            continue
         for p, f in s.r.resolve(spec):
             parent, recno = s.r.link_pos[p] or (None, None)
             out.append((parent, f.fid, recno, p))
@@ -1627,13 +1630,13 @@ def cmd_ln(d, args):
         *srcs, dest = args.paths
         if not srcs:
             raise FormatError('ln: リンク先パスとリンクするファイルを指定してください')
-        _, df = resolve_one(s.r, dest, args.fid, 'ln')
+        _, df = resolve_one(s.r, dest, 'ln')
         attrs = tuple(cli_int(x) for x in args.attrs.split('.')) if args.attrs else (0, 0, 0, 0, 0)
         if len(attrs) != 5:
             raise FormatError('ln: -a は 属性1.属性2.属性3.属性4.属性5 です')
         pos = args.pos
         for spec in srcs:
-            for _, f in ([resolve_one(s.r, spec, True, 'ln')] if args.fid else s.r.resolve(spec)):
+            for _, f in s.r.resolve(spec):
                 s.fm.ins_rec(df.fid, pos, 0, 0, link=(f.fid, attrs))
                 if pos is not None:
                     pos += 1
@@ -1682,10 +1685,10 @@ def cmd_cp(d, args):
         *srcs, dest = args.paths
         if not srcs:
             raise FormatError('cp: 複製するファイルと複製先を指定してください')
-        _, df = resolve_one(s.r, dest, args.fid, 'cp')
+        _, df = resolve_one(s.r, dest, 'cp')
         mapping = {}
         for spec in srcs:
-            for p, f in ([resolve_one(s.r, spec, True, 'cp')] if args.fid else s.r.resolve(spec)):
+            for p, f in s.r.resolve(spec):
                 la = s.r.link_attrs.get(p) or (0, 0, 0, 0, 0)
                 if args.recursive:
                     new = _copy_tree(s, f.fid, mapping)
@@ -1701,14 +1704,14 @@ def cmd_cp(d, args):
 
 def cmd_rcp(d, args):
     def body(s):
-        _, sf = resolve_one(s.r, args.src, args.fid, 'rcp')
+        _, sf = resolve_one(s.r, args.src, 'rcp')
         try:
-            _, df = resolve_one(s.r, args.dest, args.fid, 'rcp')
+            _, df = resolve_one(s.r, args.dest, 'rcp')
         except FormatError:
-            if args.fid:
+            if FID_PATH.match(args.dest) and '/' not in args.dest[1:]:
                 raise
             parent, name = split_parent(args.dest)
-            _, pf = resolve_one(s.r, parent, False, 'rcp')
+            _, pf = resolve_one(s.r, parent, 'rcp')
             df = s.fm.file(s.fm.cre_fil(pf.fid, name, sf.apptype))
         if df.fid == sf.fid:
             raise FormatError('rcp: 複製元と複製先が同じです')
@@ -1719,43 +1722,66 @@ def cmd_rcp(d, args):
     return run_session(d, body)
 
 
+def read_stdin():
+    """標準入力を最後まで読む. 端末・空・読み込みエラーは FormatError (何も変更しないため)."""
+    if sys.stdin is None or sys.stdin.isatty():
+        raise FormatError('標準入力が端末です. ファイルをリダイレクトするかパイプで渡してください')
+    try:
+        data = sys.stdin.buffer.read()
+    except OSError as e:
+        raise FormatError('標準入力を読めませんでした: %s' % e)
+    if not data:
+        raise FormatError('標準入力が空です (何も変更しません)')
+    return data
+
+
 def cmd_apd(d, args):
     def body(s):
-        _, f1 = resolve_one(s.r, args.path1, args.fid, 'apd')
+        _, f1 = resolve_one(s.r, args.path1, 'apd')
         n1 = len(f1.records())
         pos = args.pos
+        dstart = dcnt = None
         if args.delete:
-            start, cnt = parse_pair(args.delete, '-d', 1)
-            if not 0 <= start < n1 or cnt < 1 or start + cnt > n1:
+            dstart, dcnt = parse_pair(args.delete, '-d', 1)
+            if not 0 <= dstart < n1 or dcnt < 1 or dstart + dcnt > n1:
                 raise FormatError('apd: 削除範囲が不正です')
-            pos = start
+            pos = dstart
+        override = parse_pair(args.type, '-t') if args.type else None
+        if override and not 1 <= override[0] <= 31:
+            raise FormatError('apd: -t のレコードタイプは 1〜31 です')
         recs = []
-        src_fid = None
-        if args.path2:
-            _, f2 = resolve_one(s.r, args.path2, args.fid, 'apd')
-            src_fid = f2.fid
+        if args.path2 == '-':
+            # 標準入力から 1 レコード (既定はタイプ 31・サブタイプ 0). 読み切るまで何も変更しない
+            if override:
+                t, st = override
+            elif dcnt and f1.records()[dstart]['kind'] == 'data':     # 差し替え: 元のタイプを引き継ぐ
+                t, st = f1.records()[dstart]['type'], f1.records()[dstart]['subtype']
+            else:
+                t, st = 31, 0
+            recs = [{'kind': 'data', 'type': t, 'subtype': st if st is not None else 0,
+                     '_data': read_stdin()}]
+            override = None
+        elif args.path2:
+            _, f2 = resolve_one(s.r, args.path2, 'apd')
             recs = list(f2.records())
             if args.range:
                 a, cnt = parse_pair(args.range, '-r', 1)
                 if not 0 <= a < len(recs):
                     raise FormatError('apd: 複製開始レコード %d は範囲外です' % a)
                 recs = recs[a:a + cnt]
+            if override and any(r['kind'] == 'link' for r in recs):
+                raise FormatError('apd: リンクレコードには -t を指定できません')
             # 複製元のデータを削除前に読んでおく (同じファイル同士でも安全)
             recs = [dict(r, _data=f2.read_record(r)) if r['kind'] == 'data' else r for r in recs]
         elif not args.delete:
-            raise FormatError('apd: 複製元のファイル (PATH2) または -d を指定してください')
-        override = parse_pair(args.type, '-t') if args.type else None
-        if override and override[0] == 0:
-            raise FormatError('apd: -t のレコードタイプは 1〜31 です')
-        if args.delete:
-            for _ in range(cnt):
-                s.fm.del_rec(f1.fid, pos)
-        if pos is not None and not 0 <= pos <= len(s.fm.file(f1.fid).records()):
+            raise FormatError('apd: 複製元のファイル (PATH2、標準入力は -) または -d を指定してください')
+        if pos is not None and not 0 <= pos <= n1 - (dcnt or 0):
             raise FormatError('apd: 挿入位置 %d は範囲外です' % pos)
+        if dcnt:
+            for _ in range(dcnt):
+                s.fm.del_rec(f1.fid, dstart)
         for r in recs:
             if r['kind'] == 'link':
-                if override:
-                    raise FormatError('apd: リンクレコードには -t を指定できません')
                 s.fm.ins_rec(f1.fid, pos, 0, r['subtype'], link=(r['link_fid'], r['attrs']))
             else:
                 t = override[0] if override else r['type']
@@ -1771,7 +1797,7 @@ def cmd_recv(d, args):
         *hosts, dest = args.paths
         if not hosts:
             raise FormatError('recv: 取り込むファイルと取り込み先を指定してください')
-        _, df = resolve_one(s.r, dest, args.fid, 'recv')
+        _, df = resolve_one(s.r, dest, 'recv')
         rtype, sub = parse_pair(args.type, '-t', 0) if args.type else (31, 0)
         for h in hosts:
             data = open(h, 'rb').read()
@@ -1962,7 +1988,6 @@ def main():
 
     def path_cmd(name, help_, nargs='*'):
         p = sub.add_parser(name, help=help_)
-        p.add_argument('-i', '--fid', action='store_true', help='PATH の代わりにファイルID で指定')
         p.add_argument('paths', nargs=nargs, metavar='PATH')
         return p
 
@@ -1987,7 +2012,6 @@ def main():
     p = sub.add_parser('check', help='整合性チェック (読み取りのみ)')
     p.add_argument('-v', dest='verbose', action='store_true', help='警告を全件表示')
     p = sub.add_parser('ren', help='ファイル名の変更 (書き込み)')
-    p.add_argument('-i', '--fid', action='store_true', help='PATH の代わりにファイルID で指定')
     p.add_argument('-v', dest='verbose', action='store_true', help='変更結果を表示')
     p.add_argument('path', metavar='PATH')
     p.add_argument('name', metavar='NAME')
@@ -2017,18 +2041,16 @@ def main():
     p.add_argument('-r', dest='recursive', action='store_true', help='リンク先のファイルも複製')
     p.add_argument('-v', dest='verbose', action='store_true')
     p = sub.add_parser('rcp', help='名前を付けて複製 / 内容の置き換え: rcp SRC NEWPATH (書き込み)')
-    p.add_argument('-i', '--fid', action='store_true', help='PATH の代わりにファイルID で指定')
     p.add_argument('-r', dest='recursive', action='store_true', help='リンク先のファイルも複製')
     p.add_argument('src', metavar='SRC')
     p.add_argument('dest', metavar='NEWPATH')
     p = sub.add_parser('apd', help='レコードの挿入 / 追加 / 削除 (書き込み)')
-    p.add_argument('-i', '--fid', action='store_true', help='PATH の代わりにファイルID で指定')
     p.add_argument('-p', dest='pos', type=num, help='PATH1 の挿入位置 (既定: 最後)')
     p.add_argument('-d', dest='delete', metavar='N.C', help='PATH1 のレコード N から C 個削除 (その位置に挿入)')
     p.add_argument('-r', dest='range', metavar='N.C', help='PATH2 のレコード N から C 個を複製 (既定: 全部)')
     p.add_argument('-t', dest='type', metavar='T.S', help='複製後のレコードタイプ.サブタイプ')
     p.add_argument('path1', metavar='PATH1')
-    p.add_argument('path2', metavar='PATH2', nargs='?')
+    p.add_argument('path2', metavar='PATH2', nargs='?', help='複製元. "-" は標準入力 (既定タイプ 31.0)')
     p = path_cmd('recv', 'Linux のファイルを取り込む: recv HOSTFILE.. DEST (書き込み)', nargs='+')
     p.add_argument('-d', dest='replace', action='store_true', help='同名ファイルがあれば削除して置き換え')
     p.add_argument('-c', dest='strip_eof', action='store_true', help='最後の Ctrl-Z を削除')

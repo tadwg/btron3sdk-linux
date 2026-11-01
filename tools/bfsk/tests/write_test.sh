@@ -33,6 +33,12 @@ run apd /WORK/新規A /WORK/h.txt
 run apd -t 8.0x45 /WORK/新規A /WORK/r.bin
 run apd -p 0 /WORK/新規A /WORK/h.txt
 run apd -d 1.1 /WORK/新規A
+echo "+ apd -d 0.1 /WORK/新規A - (標準入力で差し替え)"
+printf 'replaced\n' | $B apd -d 0.1 /WORK/新規A - && $B tp /WORK/新規A | grep -q replaced && echo "  stdin ok" || { echo "  STDIN NG"; fail=1; }
+chk "apd stdin"
+echo "+ (エラーになるはず) 空の標準入力"
+if $B apd -d 0.1 /WORK/新規A - < /dev/null 2>/dev/null; then echo "  UNEXPECTED SUCCESS"; fail=1; fi
+$B fs /WORK/新規A | grep -q '^  0: 31' && echo "  unchanged ok" || { echo "  CHANGED"; fail=1; }
 run ln /WORK/h.txt /WORK/新規A
 run ln -p 0 -a 0x8000.0.0.0.0 /SBOOT /WORK/B
 run cp /WORK/新規A /WORK/B
@@ -44,6 +50,7 @@ run rm -r -v /WORK/新規A /WORK/B
 run empf /WORK/C
 run rm /WORK/big.bin /WORK/r32767.bin
 run ren /WORK/h.txt テキスト
+run ls -f -l /SYS:0 /SYS:1
 run mkf /WORK/X
 run recv $TMP/h.txt /WORK/X
 run apd -d 0.1 /WORK/X            # h.txt へのリンクだけ消す → 参照 0 のくずファイル
