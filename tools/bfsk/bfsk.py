@@ -140,6 +140,35 @@ def short_name(name40):
     return s
 
 
+def disp_name(name):
+    """表示用の名前: CLI と同じく全角英数記号を半角にする (かな漢字はそのまま)."""
+    out = []
+    for ch in name:
+        o = ord(ch)
+        if 0xFF01 <= o <= 0xFF5E:
+            ch = chr(o - 0xFEE0)
+        elif ch == '\u3000':
+            ch = ' '
+        elif ch in '\u2212\u2015\u2010':
+            ch = '-'
+        elif ch == '\u301c':
+            ch = '~'
+        out.append(ch)
+    return ''.join(out)
+
+
+def dwidth(text):
+    """表示幅 (EUC-JP のバイト数 = 全角 2, 半角 1)."""
+    return len(text.encode('euc-jp', 'replace'))
+
+
+def cli_time(t):
+    """CLI 形式の日時 "YYMMDD hh:mm:ss" (ローカル時刻)."""
+    if t in (0, 0xFFFFFFFF):
+        return '-'.ljust(15)
+    return datetime.datetime.fromtimestamp(t + EPOCH_1985).strftime('%y%m%d %H:%M:%S')
+
+
 def norm_name(name):
     """名前比較用の正規化: CLI と同様に全角/半角を区別しない."""
     return unicodedata.normalize('NFKC', name).translate(_NAME_FOLD)
@@ -699,7 +728,8 @@ class Resolver:
             key = norm_name(name)
             n = seen.get(key, 0)
             seen[key] = n + 1
-            out.append((name if n == 0 else '%s:%d' % (name, n), name, n, fid, attrs, recno))
+            dn = disp_name(name)
+            out.append((dn if n == 0 else '%s:%d' % (dn, n), name, n, fid, attrs, recno))
         return out
 
     def resolve(self, path):
@@ -707,6 +737,9 @@ class Resolver:
         "/SYS:ファイルID[/...]" はファイル ID のファイルを起点にする (bfsk 独自の拡張)."""
         results = [([], [0], None, None)]   # (表示名, fid スタック, 最後のリンク属性, (親fid, レコード番号))
         comps = split_path(path)
+        if path.startswith('/') and comps and ''.join(ch for _, ch in comps[0]) == 'SYS' and \
+                all(t == 'lit' for t, _ in comps[0]):
+            comps = comps[1:]                   # "/SYS/..." はルートからの絶対パス (接続名 SYS)
         m = FID_PATH.match(path)
         if m:
             try:
@@ -740,7 +773,7 @@ class Resolver:
             raise FormatError('%s: ファイルが見つかりません' % path)
         out = []
         for n, st, la, lp in results:
-            p = '/' + '/'.join(n)
+            p = '/' + '/'.join(n) if n and n[0].startswith('SYS:') else '/SYS' + ''.join('/' + x for x in n)
             self.link_attrs[p] = la
             self.link_pos[p] = lp
             out.append((p, self.file(st[-1])))
@@ -780,24 +813,31 @@ def cmd_df(d, args):
     total = st['nblk'] * st['bsize'] // 1024
     free = st['nfree'] * st['bsize'] // 1024
     used = (100 * (st['nblk'] - st['nfree']) // st['nblk']) if st['nblk'] else 0
-    print('%12s %12s %4s %6s %7s  %s' % ('TOTAL', 'FREE', 'USED', 'UNIT', 'MAXFILE', 'NAME'))
-    print('%12d %12d %3d%% %6d %7d  %s' % (total, free, used, st['bsize'], st['nfile'], st['name']))
+    print('PATH  DEV      TOTAL      FREE USED  UNIT MAXFILE NAME')
+    print('%-4s  %-4s%10d%10d%4d%%%6d%7d  %s' % ('/SYS', 'hda0' if d.base or d.boot_size >= 0x1000 else 'fda', total, free, used,
+                                                st['bsize'], st['nfile'], disp_name(st['name'])))
+
+
+def cli_size(n):
+    """ls -l の SIZE 欄: 7 桁を越えると K 単位 (CLI と同じ)."""
+    return ('%7d ' % n) if n <= 9999999 else ('%7dK' % (n // 1024))
 
 
 def cmd_ls(d, args):
     r = Resolver(d)
-    if args.long:
-        print('ATYPE ATR   NREC  NLNK  NREF       SIZE    BLK  MTIME                NAME')
-    elif args.time:
-        print('CTIME                ATIME                MTIME                NAME')
     targets = r.targets(args)
-    for tpath, tf in targets:
+    for k, (tpath, tf) in enumerate(targets):
         if args.self_:
-            entries = [(tpath, tf.fid, r.link_attrs.get(tpath))]
+            entries = [(disp_name(tf.name), tf.fid, r.link_attrs.get(tpath))]
         else:
             entries = [(disp, fid, attrs) for disp, _, _, fid, attrs, _ in r.children(tf)]
             if len(targets) > 1:
                 print('%s:' % tpath)
+        if args.long and (k == 0 or not args.self_):
+            print('ATYPE ATR   NREC NREF  SIZE   BLK  MTIME            NAME')
+        elif args.time and (k == 0 or not args.self_):
+            print('     CTIME            MTIME            ATIME       NAME')
+        col = 0
         for disp, fid, lattrs in entries:
             try:
                 f = r.file(fid)
@@ -811,41 +851,51 @@ def cmd_ls(d, args):
                 if f.refcount > 1:
                     name += '#'
             if args.long:
-                print('%04x  %s %5d %5d %5d %10d %6d  %s  %s' % (
-                    f.apptype, attr_str(f, lattrs), f.nrec, f.nlink, f.refcount, f.size, f.nblk,
-                    fmt_time_s(f.t_upd), name))
+                print('%04x %s %2d %-2d %2d %s%5d  %s  %s' % (
+                    f.apptype, attr_str(f, lattrs), f.nrec, f.nlink, f.refcount, cli_size(f.size),
+                    f.nblk, cli_time(f.t_upd), name))
             elif args.time:
-                print('%s  %s  %s  %s' % (fmt_time_s(f.t_gen), fmt_time_s(f.t_acc),
-                                          fmt_time_s(f.t_upd), name))
-            else:
-                print(name)
+                print('%s  %s  %s  %s' % (cli_time(f.t_gen), cli_time(f.t_upd), cli_time(f.t_acc), name))
+            else:                               # 20 桁 x 4 列 (CLI と同じ)
+                if col == 3:
+                    print(name)
+                    col = 0
+                else:
+                    print(name + ' ' * max(1, 20 - dwidth(name)), end='')
+                    col += 1
+        if col:
+            print()
+
+
+def cli_subtype(st):
+    return '0' if st == 0 else '0x%x' % st
 
 
 def cmd_fs(d, args):
     r = Resolver(d)
     targets = r.targets(args)
     for tpath, f in targets:
-        if len(targets) > 1:
-            print('%s:' % tpath)
+        print('%s:' % tpath)
         recs = r.fs.rec_list(f.fid)
         for i, rec in enumerate(recs):
             if rec['kind'] == 'link':
                 try:
-                    name = r.file(rec['link_fid']).name
+                    name = disp_name(r.file(rec['link_fid']).name)
                 except FormatError:
                     name = '*?'
                 if args.long:
-                    print('%3d: 0 %04x : %5d [%s] : %s' % (
-                        i, rec['subtype'], rec['link_fid'],
+                    print('%2d: %3d %6s : %5d [%s] : %s' % (
+                        i, 0, cli_subtype(rec['subtype']), rec['link_fid'],
                         ' '.join('%04x' % a for a in rec['attrs']), name))
                 else:
-                    print('%3d: 0 %04x : %s' % (i, rec['subtype'], name))
+                    print('%2d: %3d %6s : %s' % (i, 0, cli_subtype(rec['subtype']), name))
             else:
-                line = '%3d: %2d %04x : %d' % (i, rec['type'], rec['subtype'], rec['size'])
-                if args.long:
+                line = '%2d: %3d %6s : %d' % (i, rec['type'], cli_subtype(rec['subtype']), rec['size'])
+                if args.blocks:
                     line += '  [blk %s ofs %d]' % (' '.join('%d+%d' % (a, c) if c > 1 else '%d' % a
                                                            for a, c in rec['extents']) or '-', rec['offset'])
                 print(line)
+        print('--- End of Record ---')
         if len(recs) != f.nrec:
             print('warning: ヘッダの総レコード数 %d と一覧の件数 %d が一致しません'
                   % (f.nrec, len(recs)), file=sys.stderr)
@@ -1194,8 +1244,6 @@ class FileManager:
         if size == 0:
             return 0, []
         lead = 0
-        if (-size) % bs == 1:            # 末尾に 1 バイトだけ残ると区切りコードが置けない
-            lead = 2
         nblk = (lead + size + bs - 1) // bs
         ext = self.alloc(nblk)
         buf = bytes(lead) + data
@@ -1318,7 +1366,7 @@ class FileManager:
                 if gap - 4:
                     free.append((pos + 2, gap - 4))
             pos = b
-        if 0 < pos < bs:
+        if 0 < pos < bs - 1:               # 末尾 1 バイトだけ余るときはコードを置かない (実機と同じ)
             codes.append((pos, bs - pos - 2))
             if bs - pos - 2:
                 free.append((pos + 2, bs - pos - 2))
@@ -1552,7 +1600,7 @@ class Checker:
                     elif x:
                         free.add((blk, pos + 2, x))
                 pos = b
-            if 0 < pos < d.blksz:                        # 末尾の空き: [z][空き z]
+            if 0 < pos < d.blksz - 1:                    # 末尾の空き: [z][空き z]
                 z = d.blksz - pos - 2
                 if z < 0 or struct.unpack_from('<H', data, pos)[0] != z:
                     self.err('%s: ブロック %d 末尾の区切りコード不正' % (who, blk))
@@ -1961,17 +2009,22 @@ def cmd_chmod(d, args):
     targets = r.targets(args)
     if args.ngroup is not None:
         raise FormatError('chmod: -n (所有グループ) には未対応です')
+    header_done = False
     for tpath, f in targets:
         if any(v is not None for v in (args.owner, args.group, args.public)):
             r.fs.chg_fmd(f.fid, args.owner, args.group, args.public)
         if args.attr is not None:
             r.fs.chg_fat(f.fid, args.attr)
         f = r.fs.fil_sts(f.fid)
+        if not header_done:
+            print('FNAME                  ATTR OWN GROUP        PUBLIC       GRPN')
+            header_done = True
         g, p = f.acc_levels
         m = f.owner_mode
-        print('%s  owner=%s%s%s(%d) group=0x%03x public=0x%03x attr=%s%s' % (
-            tpath, 'R' if m & 4 else '-', 'W' if m & 2 else '-', 'E' if m & 1 else '-', m, g & 0xFFF,
-            p & 0xFFF, 'R' if f.attr & 0x10 else '-', 'P' if f.attr & 0x20 else '-'))
+        lv = lambda v: 'R%2d W%2d E%2d' % (v >> 8 & 15, v >> 4 & 15, v & 15)
+        attr = ''.join(c if f.attr & bit else '-' for c, bit in (('P', 0x20), ('R', 0x10), ('1', 0x40), ('2', 0x80)))
+        own = ''.join(c if m & bit else '-' for c, bit in (('R', 4), ('W', 2), ('E', 1)))
+        print('%-22s %s %s %s  %s  %-12s' % (disp_name(f.name), attr, own, lv(g), lv(p), ''))
 
 
 def cmd_chtime(d, args):
@@ -1992,17 +2045,16 @@ def cmd_touch(d, args):
 
 
 def hexdump(data, half, out):
+    """CLI の tp -x (ハーフワード, 8 個/行) / tp -b (バイト, 16 個/行) と同じ形式."""
     for off in range(0, len(data), 16):
         chunk = data[off:off + 16]
         if half:
-            cells = ' '.join('%04x' % struct.unpack_from('<H', chunk.ljust(len(chunk) + len(chunk) % 2, b'\0'), k)[0]
-                             for k in range(0, len(chunk), 2))
-            width = 39
+            if len(chunk) % 2:
+                chunk += b'\0'
+            cells = ' '.join('%04x' % struct.unpack_from('<H', chunk, k)[0] for k in range(0, len(chunk), 2))
         else:
             cells = ' '.join('%02x' % b for b in chunk)
-            width = 47
-        txt = ''.join(chr(b) if 0x20 <= b < 0x7F else '.' for b in chunk)
-        out.write('%08x  %-*s  %s\n' % (off, width, cells, txt))
+        out.write('%04x: %s\n' % (off, cells))
 
 
 def cmd_tp(d, args):
@@ -2052,7 +2104,8 @@ def main():
     m.add_argument('-l', dest='long', action='store_true', help='詳細情報')
     m.add_argument('-t', dest='time', action='store_true', help='日時情報')
     p = path_cmd('fs', 'レコード構成')
-    p.add_argument('-l', dest='long', action='store_true', help='詳細表示')
+    p.add_argument('-l', dest='long', action='store_true', help='詳細表示 (リンクのファイル ID と属性)')
+    p.add_argument('-b', dest='blocks', action='store_true', help='データの配置ブロックも表示 (bfsk 独自)')
     path_cmd('stat', 'ファイルヘッダの詳細')
     p = path_cmd('tp', 'レコード内容 (既定は生データを標準出力へ)', nargs=1)
     p.add_argument('-r', dest='record', type=cli_int, default=0, help='レコード番号 (既定 0)')
