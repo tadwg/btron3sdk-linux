@@ -198,6 +198,7 @@ static VOID post_pointer_event(W vx, W vy, W main_btn, W sub_btn, W wheel, W mid
             gPdMsg2.stat.cmd  = INP_PD2;
             gPdMsg2.stat.err  = DEV_OK;
             gPdMsg2.wheel     = (H)wheel;
+            DEBUG_PRINT(("qemumouse: post_wheel wheel=%d\n", wheel));
             snd_msg(gKbpdMailboxID, (T_MSG *)&gPdMsg2);
         }
     }
@@ -240,10 +241,10 @@ static VOID poll_task(W *pParam)
             sub_btn  = (btn & VMMOUSE_RIGHT_BUTTON)  ? 1 : 0;
             mid_btn  = (btn & VMMOUSE_MIDDLE_BUTTON) ? 1 : 0;
 
-            if (x != gLastX || y != gLastY || main_btn != gLastBtn
-                || sub_btn || mid_btn || wheel != 0) {
+            /* 座標・いずれかのボタンの変化 (押下と解放), ホイール回転で送信 */
+            if (x != gLastX || y != gLastY || btn != gLastBtn || wheel != 0) {
                 post_pointer_event(x, y, main_btn, sub_btn, wheel, mid_btn);
-                gLastX = x;  gLastY = y;  gLastBtn = main_btn;
+                gLastX = x;  gLastY = y;  gLastBtn = btn;
             }
         }
     }
