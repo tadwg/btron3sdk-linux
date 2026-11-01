@@ -216,7 +216,9 @@ static VOID kb_byte(UB b)
     UB   code = b & 0x7F;
     BOOL press = !(b & 0x80);
 
-    if (b == 0xFA || b == 0xFE || b == 0xAA || b == 0xEE || b == 0x00 || b == 0xFF) return;
+    /* キーボードの応答 (ACK / 再送 / エコー / エラー). 0xAA は自己診断の完了応答と同じ値だが
+       左 Shift の解放でもあるので捨てない (このドライバはキーボードをリセットしない) */
+    if (b == 0xFA || b == 0xFE || b == 0xEE || b == 0x00 || b == 0xFF) return;
     if (gE1 > 0) {                          /* Pause: E1 1D 45 E1 9D C5 */
         if (--gE1 == 0 && code == 0x45) {
             send_key(0x82, press, FALSE);
@@ -444,7 +446,7 @@ ERR main(Bool StartUp, TC *arg)
     DEBUG_PRINT(("qemukbpd: kbpd mbx=%d vmmouse=%d\n", gMbx, gMouse));
 
     memset(&cflg, 0, sizeof(cflg));
-    cflg.flgatr = TA_WSGL;
+    cflg.flgatr = TA_WMUL;          /* kbpd と qemukbpd の両方が待つ */
     gFlg = vcre_flg(&cflg);
     if (gFlg < 0) { b_cls_dev(gKbpdDD, 0, NULL); return ER_NOSPT | ED_CRE_FLG; }
 
