@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # qemumouse のビルド (btron3sdk コンテナ内で実行)
 #   podman run --rm -v $PWD:/workspace:z btron3sdk:latest bash /workspace/driver/qemumouse/build.sh
 # 出力: driver/qemumouse/bin/qemumouse (リリース), qemumouse.debug (DEBUG_PRINT 有効)

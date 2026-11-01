@@ -87,3 +87,7 @@ QEMU 9.0 (KVM なし) で、超漢字V の体験版イメージ (VMware 用の 4
   画面座標を指定して操作できます (QEMU へは 0〜32767、ドライバへは 0〜65535 の値で渡ります)
 - `qemukbpd` / `qemumouse` が無いときは PS/2 マウス (相対座標) だけで、`btctl move` / `click` は
   「Input handler not found for event type abs」というエラーになります
+
+## ライセンス
+
+MIT ライセンス ([LICENSE](../../LICENSE))。

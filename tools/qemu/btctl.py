@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """QEMU 上の超漢字V を操作する (コンテナ内で実行. tools/qemu/btctl から呼ぶ).
 
   cli CMD...                シリアルの CLI でコマンドを実行し出力を表示 (DEBUGMODE 1 が必要)

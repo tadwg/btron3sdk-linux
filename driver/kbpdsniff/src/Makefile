@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 #	Makefile (kbpdsniff)
 #	kbpd key map probe

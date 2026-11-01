@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 # bfsk 書き込みコマンドのテスト. 各操作の後に check を実行する.
 # 使い方: tests/write_test.sh IMAGE   (IMAGE は書き換えるので必ずコピーを渡すこと)
 set -u

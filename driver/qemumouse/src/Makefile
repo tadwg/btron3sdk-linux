@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 #	Makefile (qemumouse)
 #	QEMU (vmmouse) Absolute Mouse Driver for BTRON3

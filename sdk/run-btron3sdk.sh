@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 # BTRON3 (超漢字V) 開発環境コンテナ起動スクリプト
 #
 # 使い方:

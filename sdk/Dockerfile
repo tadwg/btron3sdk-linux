@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 # =============================================================================
 # BTRON3 (超漢字V) Cross Development Environment
 # ベースイメージ: Rocky Linux 9

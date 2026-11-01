@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * kbprobe.c  調査用ドライバ: kbpd のキーマップの変化をシリアルに出力する
  *

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * kbpdsniff.h  調査用: ダミーの kbpd
  * This program is free software; you can redistribute it and/or modify

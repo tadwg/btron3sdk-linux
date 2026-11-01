@@ -19,3 +19,7 @@ lowkbpd などの実 IO ドライバが入力メイルボックスに送るメ�
 - マウス: qemumouse を使っているとき、vmmouse のイベントごとに lowkbpd から PS/2 由来の
   `INP_PD` (abs=0, x=+3, y=0, ボタンすべて OFF, onebut=1) が qemumouse の `INP_PD` (abs=1) の直前に届く。
   ボタンを押したまま移動すると「押下」と「解放」が交互に届くため、ドラッグができない
+
+## ライセンス
+
+GPL version 2 またはそれ以降 ([driver/COPYING](../COPYING))。

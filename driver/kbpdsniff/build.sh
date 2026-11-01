@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # kbpdsniff のビルド (btron3sdk コンテナ内で実行)
 #   podman run --rm -v $PWD:/workspace:z btron3sdk:latest bash /workspace/driver/kbpdsniff/build.sh
 # 出力: driver/kbpdsniff/bin/kbpdsniff (リリース), kbpdsniff.debug (DEBUG_PRINT 有効)

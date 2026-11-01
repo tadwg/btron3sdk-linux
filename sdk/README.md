@@ -68,7 +68,7 @@ sdk/run-btron3sdk.sh gterm      # gterm デバッグ接続（TCP 9999）
 
 ## ライセンス
 
-このディレクトリの Dockerfile および起動スクリプトは MIT ライセンスです。
+このディレクトリの Dockerfile および起動スクリプトは MIT ライセンスです ([LICENSE](../LICENSE))。
 
 ダウンロードされる brightv アーカイブは Personal Media Corporation の著作物であり、
 使用条件については [超漢字開発者向けページ](https://www.chokanji.com/developer/) をご確認ください。

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # kbprobe のビルド (btron3sdk コンテナ内で実行)
 #   podman run --rm -v $PWD:/workspace:z btron3sdk:latest bash /workspace/driver/kbprobe/build.sh
 # 出力: driver/kbprobe/bin/kbprobe (リリース), kbprobe.debug (DEBUG_PRINT 有効)

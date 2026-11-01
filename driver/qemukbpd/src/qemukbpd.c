@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * qemukbpd.c
  * QEMU 用 キーボード + 絶対座標マウス 実 IO ドライバ (lowkbpd の代わり) for BTRON3

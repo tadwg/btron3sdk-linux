@@ -86,5 +86,9 @@ KVM が使えない環境でも動きます (起動に 30〜50 秒ほど)。QEMU
 
 ## ライセンス
 
-`sdk/` の Dockerfile および起動スクリプトは MIT ライセンスです。
-ダウンロードされる brightv アーカイブの使用条件は [sdk/README.md](sdk/README.md#ライセンス) を参照してください。
+- `driver/` 以外 (`sdk/`・`tools/` など): MIT ライセンス ([LICENSE](LICENSE))
+- `driver/`: GNU General Public License version 2 またはそれ以降 ([driver/COPYING](driver/COPYING))。
+  ドライバは [tadwg/virtualbox-additions](https://github.com/tadwg/virtualbox-additions) の GPL のコードをもとにしています
+
+各ファイルの先頭に `SPDX-License-Identifier` を書いています。
+`sdk/` のコンテナがダウンロードする brightv アーカイブの使用条件は [sdk/README.md](sdk/README.md#ライセンス) を参照してください。

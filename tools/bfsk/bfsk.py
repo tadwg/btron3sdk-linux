@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """bfsk - BTRON (超漢字V) ディスクイメージ操作ツール
 
 対応イメージ形式 (内容から自動判別):

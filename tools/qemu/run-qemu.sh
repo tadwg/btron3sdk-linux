@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 # 超漢字V のディスクイメージを QEMU で起動する (podman コンテナ内, 外部ネットワーク無し)
 #
 #   tools/qemu/run-qemu.sh IMAGE          起動 (バックグラウンド)

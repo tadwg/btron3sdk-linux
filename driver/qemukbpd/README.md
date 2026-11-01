@@ -91,4 +91,4 @@ vmmouse が使えないとき (QEMU の vmport が無効など) はキーボー�
 
 ## ライセンス
 
-GPL version 2 またはそれ以降。
+GPL version 2 またはそれ以降 ([driver/COPYING](../COPYING))。

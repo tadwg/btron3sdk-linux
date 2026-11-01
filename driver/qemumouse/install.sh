@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # qemumouse を超漢字V のディスクイメージに組み込む (bfsk を使用. 仮想マシン停止中に実行)
 #   driver/qemumouse/install.sh IMAGE [debug]
 # - /SYS/qemumouse として取り込む (アプリケーションタイプ 3, レコードタイプ 31・サブタイプ 0x4530: 既存ドライバと同じ)

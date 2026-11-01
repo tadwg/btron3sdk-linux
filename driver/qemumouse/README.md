@@ -88,4 +88,4 @@ $BFSK apd -d 0.1 /SYS/STARTUP.CMD - < startup.txt
 
 ## ライセンス
 
-GPL version 2 またはそれ以降 (virtualbox-additions と同じ)。
+GPL version 2 またはそれ以降 ([driver/COPYING](../COPYING))。virtualbox-additions と同じです。

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 #	Makefile (qemukbpd)
 #	QEMU keyboard + absolute mouse driver for BTRON3

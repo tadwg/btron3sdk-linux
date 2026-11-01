@@ -1,3 +1,4 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 # 起動中の QEMU (run-qemu.sh) を操作する. 詳細: btctl -h
 exec podman exec "${QEMU_NAME:-btron-qemu}" python3 /t/btctl.py "$@"

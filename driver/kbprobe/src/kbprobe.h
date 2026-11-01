@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * kbprobe.h
  * kbpd key map probe (調査用)

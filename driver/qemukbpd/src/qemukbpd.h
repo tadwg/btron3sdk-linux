@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * qemukbpd.h
  * QEMU keyboard + absolute mouse driver for BTRON3 (lowkbpd の代わり)

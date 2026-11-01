@@ -242,3 +242,7 @@ bfsk で読み戻して元データと一致することを確認しています
 - [BTRON3 仕様 1.6 ファイル管理 (パス名と出現順、リンクファイル)](https://www.chokanji.com/developer/doc/btron3/os_spec/kernel/file.html)
 - [BTRON3 仕様 3.8 実身/仮身マネージャ (仮身の属性)](https://www.chokanji.com/developer/doc/btron3/os_spec/shell/omgr.html)
 - [超漢字V R4 仕様差分 (拡張形式2)](https://www.chokanji.com/developer/doc/brightv.r4/diff/diff.html#section04)
+
+## ライセンス
+
+MIT ライセンス ([LICENSE](../../LICENSE))。

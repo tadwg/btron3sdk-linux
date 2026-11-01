@@ -5,3 +5,7 @@ kbpd のキーマップ (`DN_KEYMAP`) の変化を 10ms ごとに調べ、押さ
 調べるために使います。起動時にキーボード ID (`DN_KEYID`) とキーボード定義の大きさも出力します。
 
 出力は `DEBUG_PRINT` なのでデバッグビルド (`bin/kbprobe.debug`) を、`DEBUGMODE 1` のイメージで使います。
+
+## ライセンス
+
+GPL version 2 またはそれ以降 ([driver/COPYING](../COPYING))。
