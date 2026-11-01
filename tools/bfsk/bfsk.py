@@ -615,16 +615,17 @@ class BFile:
 
 
 def cmd_info(d, args):
+    st = FileManager(d).fs_sts()
     print('image format     : %s' % d.img.kind)
     print('partition offset : 0x%x' % d.base)
     print('boot area size   : %d' % d.boot_size)
     print('disk id / format : 0x%04x / 0x%04x' % (d.disk_id, d.fmt_id))
-    print('block size       : %d' % d.blksz)
-    print('blocks total/free: %d / %d' % (d.nlb, d.nfree))
-    print('max files        : %d' % d.nfmax)
-    print('fs name          : %s' % d.fsname)
-    print('device           : %s' % d.devname)
-    print('created / updated: %s / %s' % (fmt_time(d.t_gen), fmt_time(d.t_upd)))
+    print('block size       : %d' % st['bsize'])
+    print('blocks total/free: %d / %d' % (st['nblk'], st['nfree']))
+    print('max files        : %d' % st['nfile'])
+    print('fs name          : %s' % st['name'])
+    print('device           : %s' % st['locat'])
+    print('created / updated: %s / %s' % (fmt_time(st['ctime']), fmt_time(st['mtime'])))
 
 
 # ---------------------------------------------------------------------------
@@ -675,23 +676,22 @@ def parse_comp(toks):
 
 
 class Resolver:
-    def __init__(self, disk):
-        self.d = disk
-        self._cache = {}
+    """パス解決. ファイルの参照はすべてファイル管理層 (FileManager) を通す."""
+
+    def __init__(self, fs):
+        self.fs = fs if isinstance(fs, FileManager) else FileManager(fs)
+        self.d = self.fs.d
         self.link_attrs = {}            # 解決したパス → そこへ至るリンクの属性データ1〜5
         self.link_pos = {}              # 解決したパス → (親ファイル fid, リンクレコード番号)
 
     def file(self, fid):
-        f = self._cache.get(fid)
-        if f is None:
-            f = self._cache[fid] = self.d.open_file(fid)
-        return f
+        return self.fs.fil_sts(fid)
 
     def children(self, f):
         """(表示名, 名前, 出現順, fid, リンク属性, レコード番号) の列. 同名 2 つ目以降は "名前:N"."""
         seen = {}
         out = []
-        for recno, fid, attrs in f.links():
+        for recno, fid, attrs in self.fs.fnd_lnk(f.fid):
             try:
                 name = self.file(fid).name
             except FormatError:
@@ -776,11 +776,12 @@ def attr_str(f, link_attrs=None):
 
 
 def cmd_df(d, args):
-    total = d.nlb * d.blksz // 1024
-    free = d.nfree * d.blksz // 1024
-    used = (100 * (d.nlb - d.nfree) // d.nlb) if d.nlb else 0
+    st = FileManager(d).fs_sts()
+    total = st['nblk'] * st['bsize'] // 1024
+    free = st['nfree'] * st['bsize'] // 1024
+    used = (100 * (st['nblk'] - st['nfree']) // st['nblk']) if st['nblk'] else 0
     print('%12s %12s %4s %6s %7s  %s' % ('TOTAL', 'FREE', 'USED', 'UNIT', 'MAXFILE', 'NAME'))
-    print('%12d %12d %3d%% %6d %7d  %s' % (total, free, used, d.blksz, d.nfmax, d.fsname))
+    print('%12d %12d %3d%% %6d %7d  %s' % (total, free, used, st['bsize'], st['nfile'], st['name']))
 
 
 def cmd_ls(d, args):
@@ -826,7 +827,7 @@ def cmd_fs(d, args):
     for tpath, f in targets:
         if len(targets) > 1:
             print('%s:' % tpath)
-        recs = f.records()
+        recs = r.fs.rec_list(f.fid)
         for i, rec in enumerate(recs):
             if rec['kind'] == 'link':
                 try:
@@ -883,10 +884,11 @@ REF_MAX = 255
 
 
 class FileManager:
+    """ファイル管理層. 読み取り専用で開いたディスクでも参照系の操作は使える."""
+
     def __init__(self, disk):
         d = self.d = disk
-        if not d.writable:
-            raise FormatError('読み取り専用で開いています')
+        self.modified = False
         self.nbytes = d.nbmp * (4 if d.fmt_id != 0x6400 else 1)
         self.bm_off = d.block_offset(1) + 128
         self.bm = bytearray(d._read(self.bm_off, self.nbytes))
@@ -896,6 +898,74 @@ class FileManager:
         self.first_data = 1 + d.ssys + d.sfidt + d.sfnmt
         self.hint = self.first_data
         self.cache = {}
+
+    # --- 参照系 (fs_sts / fil_sts / rea_rec / fnd_lnk 相当) -------------------
+    def fs_sts(self):
+        """ファイルシステム管理情報 (FS_STATE 相当)."""
+        d = self.d
+        return {'bsize': d.blksz, 'nfile': d.nfmax, 'lang': d.lang, 'level': d.acl,
+                'nblk': d.nlb, 'nfree': self.nfree, 'mtime': d.t_upd, 'ctime': d.t_gen,
+                'name': d.fsname, 'locat': d.devname}
+
+    def fil_sts(self, fid):
+        """ファイル管理情報 (F_STATE 相当). ファイルヘッダを読んだ BFile を返す."""
+        return self.file(fid)
+
+    def rec_list(self, fid):
+        """全レコードのインデックス情報 (see_rec / rea_rec で順にたどるのに相当)."""
+        return self.file(fid).records()
+
+    def rea_rec(self, fid, recno):
+        """レコード読み込み. データレコードはバイト列、リンクレコードは (fid, 属性1〜5)."""
+        f = self.file(fid)
+        recs = f.records()
+        if not 0 <= recno < len(recs):
+            raise FormatError('レコード番号 %d は範囲外です (0..%d)' % (recno, len(recs) - 1))
+        r = recs[recno]
+        if r['kind'] == 'link':
+            return r['link_fid'], r['attrs']
+        return f.read_record(r)
+
+    def fnd_lnk(self, fid):
+        """リンクレコードの一覧 [(レコード番号, リンク先 fid, 属性1〜5)] (fnd_lnk の繰り返しに相当)."""
+        return self.file(fid).links()
+
+    # --- ファイル管理情報の変更 (chg_fnm / chg_fmd / chg_fat / chg_ftm) ---------
+    def chg_fnm(self, fid, name):
+        if fid == 0:
+            raise FormatError('ルートファイル (ファイルシステム名) の変更には未対応です')
+        self.set_name(fid, name)
+
+    def chg_fmd(self, fid, owner=None, grpacc=None, pubacc=None):
+        f = self.file(fid)
+        ftype = (f.ftype << 12) | f.attr
+        if owner is not None:
+            if not 0 <= owner <= 7:
+                raise FormatError('所有者アクセスモードは 0〜7 です')
+            ftype = (ftype & ~0x7) | owner
+        fields = {H_TYPE: ('<H', ftype), H_ATIME: ('<I', now_btron())}
+        for v, off in ((grpacc, H_GRPACC), (pubacc, H_PUBACC)):
+            if v is not None:
+                if not 0 <= v <= 0xFFF:
+                    raise FormatError('アクセスレベルは 0x000〜0xFFF です')
+                fields[off] = ('<H', v)
+        f.update_header(fields)
+
+    def chg_fat(self, fid, op):
+        """アクセス属性変更: 1/2 書込不可 セット/リセット, 3/4 削除不可 セット/リセット."""
+        bit, on = {1: (0x10, True), 2: (0x10, False), 3: (0x20, True), 4: (0x20, False)}.get(op, (None, None))
+        if bit is None:
+            raise FormatError('アクセス属性の指定は 1〜4 です')
+        f = self.file(fid)
+        ftype = (f.ftype << 12) | f.attr
+        ftype = (ftype | bit) if on else (ftype & ~bit)
+        f.update_header({H_TYPE: ('<H', ftype), H_ATIME: ('<I', now_btron())})
+
+    def chg_ftm(self, fid, ltime=None, atime=None, mtime=None):
+        fields = {off: ('<I', v) for v, off in ((ltime, H_LTIME), (atime, H_ATIME), (mtime, H_MTIME))
+                  if v is not None}
+        if fields:
+            self.file(fid).update_header(fields)
 
     # --- ファイル -------------------------------------------------------
     def file(self, fid):
@@ -942,6 +1012,7 @@ class FileManager:
             return []
         if count > self.nfree:
             raise FormatError('ディスクの領域が不足しています (%d ブロック必要, 空き %d)' % (count, self.nfree))
+        self.modified = True
         runs = []
         need = count
         n = self.hint
@@ -1000,6 +1071,7 @@ class FileManager:
         return None
 
     def free(self, blocks):
+        self.modified = True
         for b in blocks:
             if not self._bit(b):
                 raise FormatError('ブロック %d は既に未使用です' % b)
@@ -1009,7 +1081,9 @@ class FileManager:
             self.nfree += 1
 
     def sync(self):
-        """ビットマップ・空きブロック数・システムブロック更新日時を書き込む."""
+        """ビットマップ・空きブロック数・システムブロック更新日時を書き込む (変更があったときだけ)."""
+        if not self.modified:
+            return
         if self.dirty:
             lo, hi = min(self.dirty), max(self.dirty) + 1
             self.d.write(self.bm_off + lo, bytes(self.bm[lo:hi]))
@@ -1017,6 +1091,7 @@ class FileManager:
         sys_off = self.d.block_offset(1)
         self.d.write(sys_off + 36, struct.pack('<II', self.nfree, now_btron()))
         self.d.nfree = self.nfree
+        self.modified = False
 
     # --- ファイル生成 / 削除 (cre_fil / del_fil) ---------------------------
     def default_ridxofs(self):
@@ -1562,10 +1637,10 @@ class Session:
     def __init__(self, d):
         self.d = d
         self.fm = FileManager(d)
-        self.r = Resolver(d)
+        self.r = Resolver(self.fm)
 
     def fresh(self):
-        self.r = Resolver(self.d)          # レコード番号が変わるので解決結果を作り直す
+        self.r = Resolver(self.fm)         # レコード番号が変わるので解決結果を作り直す
         return self.r
 
 
@@ -1644,14 +1719,14 @@ def cmd_ln(d, args):
 
 
 def _copy_records(s, src_fid, dst_fid, pos, recs, override=None, recursive=False, mapping=None):
-    """recs (src のレコード) を dst の pos から順に挿入する."""
-    src = s.fm.file(src_fid)
+    """src の全レコード (recs = rec_list) を dst の pos から順に挿入する."""
+    recs = [dict(r, _recno=i) for i, r in enumerate(recs)]
     items = []
     for r in recs:
         if r['kind'] == 'link':
             items.append(('link', r))
         else:
-            items.append(('data', r, src.read_record(r)))
+            items.append(('data', r, s.fm.rea_rec(src_fid, r['_recno'])))
     for it in items:
         r = it[1]
         if it[0] == 'link':
@@ -1676,7 +1751,7 @@ def _copy_tree(s, fid, mapping):
     new = s.fm.copy_header(fid) if f.ftype == 0 else s.fm.cre_fil(None, f.name, f.apptype)
     mapping[fid] = new
     if f.ftype != 0:
-        _copy_records(s, fid, new, None, list(f.records()), recursive=True, mapping=mapping)
+        _copy_records(s, fid, new, None, s.fm.rec_list(fid), recursive=True, mapping=mapping)
     return new
 
 
@@ -1695,7 +1770,7 @@ def cmd_cp(d, args):
                 else:
                     new = s.fm.copy_header(f.fid) if f.ftype == 0 else s.fm.cre_fil(None, f.name, f.apptype)
                     if f.ftype != 0:
-                        _copy_records(s, f.fid, new, None, list(f.records()))
+                        _copy_records(s, f.fid, new, None, s.fm.rec_list(f.fid))
                 s.fm.apd_rec(df.fid, 0, 0, link=(new, la))
                 if args.verbose:
                     print('%s -> %s (fid %d)' % (p, dest, new))
@@ -1717,7 +1792,7 @@ def cmd_rcp(d, args):
             raise FormatError('rcp: 複製元と複製先が同じです')
         while s.fm.file(df.fid).records():
             s.fm.del_rec(df.fid, len(s.fm.file(df.fid).records()) - 1, delete_unref=True)
-        _copy_records(s, sf.fid, df.fid, None, list(s.fm.file(sf.fid).records()),
+        _copy_records(s, sf.fid, df.fid, None, s.fm.rec_list(sf.fid),
                       recursive=args.recursive, mapping={})
     return run_session(d, body)
 
@@ -1763,7 +1838,7 @@ def cmd_apd(d, args):
             override = None
         elif args.path2:
             _, f2 = resolve_one(s.r, args.path2, 'apd')
-            recs = list(f2.records())
+            recs = [dict(r, _recno=i) for i, r in enumerate(s.fm.rec_list(f2.fid))]
             if args.range:
                 a, cnt = parse_pair(args.range, '-r', 1)
                 if not 0 <= a < len(recs):
@@ -1772,7 +1847,8 @@ def cmd_apd(d, args):
             if override and any(r['kind'] == 'link' for r in recs):
                 raise FormatError('apd: リンクレコードには -t を指定できません')
             # 複製元のデータを削除前に読んでおく (同じファイル同士でも安全)
-            recs = [dict(r, _data=f2.read_record(r)) if r['kind'] == 'data' else r for r in recs]
+            recs = [dict(r, _data=s.fm.rea_rec(f2.fid, r['_recno'])) if r['kind'] == 'data' else r
+                    for r in recs]
         elif not args.delete:
             raise FormatError('apd: 複製元のファイル (PATH2、標準入力は -) または -d を指定してください')
         if pos is not None and not 0 <= pos <= n1 - (dcnt or 0):
@@ -1804,7 +1880,7 @@ def cmd_recv(d, args):
             if args.strip_eof and data.endswith(b'\x1a'):
                 data = data[:-1]
             name = args.name or os.path.basename(h)
-            for disp, n, _, fid, _, recno in Resolver(d).children(s.fm.file(df.fid)):
+            for disp, n, _, fid, _, recno in s.fresh().children(s.fm.file(df.fid)):
                 if norm_name(n) == norm_name(tron_str(tron_encode(name))) and args.replace:
                     s.fm.del_fil(df.fid, recno, True)
                     break
@@ -1819,9 +1895,10 @@ def cmd_recv(d, args):
 
 def find_garbage(d):
     """ルートから到達できないファイル: (到達可能集合, くずファイル一覧)."""
+    fs = FileManager(d)
     seen, stack = {0}, [0]
     while stack:
-        for _, c, _ in d.open_file(stack.pop()).links():
+        for _, c, _ in fs.fnd_lnk(stack.pop()):
             if c not in seen and d.fid_entry(c)[0]:
                 seen.add(c)
                 stack.append(c)
@@ -1835,7 +1912,7 @@ def cmd_cleanup(d, args):
     seen, garbage = find_garbage(d)
     if args.verbose or args.dry_run:
         for fid in garbage:
-            print('fid %d %s' % (fid, d.open_file(fid).name))
+            print('fid %d %s' % (fid, FileManager(d).fil_sts(fid).name))
     if args.dry_run:
         print('くずファイル %d 個' % len(garbage))
         return
@@ -1874,40 +1951,22 @@ def cmd_ren(d, args):
     r = Resolver(d)
     args.paths = [args.path]
     tpath, f = one_target(r, args, 'ren')
-    if f.fid == 0:
-        raise FormatError('ren: ルートファイル (ファイルシステム名) の変更には未対応です')
-    name40 = tron_encode(args.name)
-    f.update_header({H_NAME: ('40s', name40), H_ATIME: ('<I', now_btron())})
-    d.set_short_name(f.fid, short_name(name40))
+    r.fs.chg_fnm(f.fid, args.name)
     if args.verbose:
-        print('%s -> %s' % (tpath, f.name))
+        print('%s -> %s' % (tpath, r.fs.fil_sts(f.fid).name))
 
 
 def cmd_chmod(d, args):
     r = Resolver(d)
     targets = r.targets(args)
-    change = any(v is not None for v in (args.owner, args.group, args.public, args.attr))
     if args.ngroup is not None:
         raise FormatError('chmod: -n (所有グループ) には未対応です')
     for tpath, f in targets:
-        if change:
-            ftype = (f.ftype << 12) | f.attr
-            if args.owner is not None:
-                if not 0 <= args.owner <= 7:
-                    raise FormatError('chmod: -o は 0〜7 です')
-                ftype = (ftype & ~0x7) | args.owner
-            if args.attr is not None:
-                bit, on = {1: (0x10, True), 2: (0x10, False), 3: (0x20, True), 4: (0x20, False)}.get(args.attr, (None, None))
-                if bit is None:
-                    raise FormatError('chmod: -a は 1〜4 です')
-                ftype = (ftype | bit) if on else (ftype & ~bit)
-            fields = {H_TYPE: ('<H', ftype), H_ATIME: ('<I', now_btron())}
-            for opt, off in ((args.group, H_GRPACC), (args.public, H_PUBACC)):
-                if opt is not None:
-                    if not 0 <= opt <= 0xFFF:
-                        raise FormatError('chmod: -g / -p は 0x000〜0xFFF です')
-                    fields[off] = ('<H', opt)
-            f.update_header(fields)
+        if any(v is not None for v in (args.owner, args.group, args.public)):
+            r.fs.chg_fmd(f.fid, args.owner, args.group, args.public)
+        if args.attr is not None:
+            r.fs.chg_fat(f.fid, args.attr)
+        f = r.fs.fil_sts(f.fid)
         g, p = f.acc_levels
         m = f.owner_mode
         print('%s  owner=%s%s%s(%d) group=0x%03x public=0x%03x attr=%s%s' % (
@@ -1917,13 +1976,10 @@ def cmd_chmod(d, args):
 
 def cmd_chtime(d, args):
     r = Resolver(d)
-    fields = {}
-    for spec, off in ((args.ltime, H_LTIME), (args.atime, H_ATIME), (args.mtime, H_MTIME)):
-        if spec is not None:
-            fields[off] = ('<I', parse_btime(spec))
+    times = [parse_btime(x) if x is not None else None for x in (args.ltime, args.atime, args.mtime)]
     for tpath, f in r.targets(args):
-        if fields:
-            f.update_header(fields)
+        r.fs.chg_ftm(f.fid, *times)
+        f = r.fs.fil_sts(f.fid)
         print('%s  limit=%s access=%s modify=%s' % (tpath, fmt_time(f.t_keep), fmt_time(f.t_acc),
                                                     fmt_time(f.t_upd)))
 
@@ -1932,7 +1988,7 @@ def cmd_touch(d, args):
     r = Resolver(d)
     t = now_btron()
     for tpath, f in r.targets(args):
-        f.update_header({H_ATIME: ('<I', t), H_MTIME: ('<I', t)})
+        r.fs.chg_ftm(f.fid, atime=t, mtime=t)
 
 
 def hexdump(data, half, out):
@@ -1955,13 +2011,9 @@ def cmd_tp(d, args):
     if len(targets) != 1:
         raise FormatError('tp: ファイルを 1 つだけ指定してください (%d 件一致)' % len(targets))
     f = targets[0][1]
-    recs = f.records()
-    if not 0 <= args.record < len(recs):
-        raise FormatError('tp: レコード番号 %d は範囲外です (0..%d)' % (args.record, len(recs) - 1))
-    rec = recs[args.record]
-    if rec['kind'] == 'link':
+    data = r.fs.rea_rec(f.fid, args.record)
+    if not isinstance(data, bytes):
         raise FormatError('tp: レコード %d はリンクレコードです' % args.record)
-    data = f.read_record(rec)
     if args.endian:
         b = bytearray(data)
         b[0:len(b) & ~1:2], b[1:len(b) & ~1:2] = b[1:len(b) & ~1:2], b[0:len(b) & ~1:2]
