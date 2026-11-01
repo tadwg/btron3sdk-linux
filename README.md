@@ -59,19 +59,22 @@ chmod +x run-btron3sdk.sh
 ./run-btron3sdk.sh gterm      # gterm デバッグ接続（TCP 9999）
 ```
 
-## ファイル構成
+## ディレクトリ構成
 
-```
-Dockerfile          コンテナビルド定義
-run-btron3sdk.sh    コンテナ起動スクリプト
-tools/bfsk/         BTRON ディスクイメージ操作ツール (詳細は tools/bfsk/README.md)
-tools/qemu/         QEMU で超漢字V を起動・操作するツール (詳細は tools/qemu/README.md)
-.github/workflows/  ドライバの自動ビルド (GitHub Actions)
-driver/qemukbpd/    QEMU 用 キーボード + 絶対座標マウスドライバ (lowkbpd の代わり)
-driver/qemumouse/   QEMU 用 絶対座標マウスドライバ (lowkbpd と併用. ドラッグ不可のため qemukbpd を推奨)
-driver/kbprobe/     調査用: kbpd のキーマップを出力 (lowkbpd のキートップコード表)
-driver/kbpdsniff/   調査用: ダミーの kbpd (実 IO ドライバからのメッセージを出力)
-```
+| パス | 内容 |
+|------|------|
+| `Dockerfile` | クロス開発環境 (btron3sdk) のコンテナ定義 |
+| `run-btron3sdk.sh` | 開発環境コンテナの起動スクリプト |
+| [`tools/bfsk/`](tools/bfsk/README.md) | BTRON ディスクイメージ (raw / VMDK / VDI) を Linux から読み書きする Python ツール。超漢字の CLI に近いコマンド (`ls` `tp` `recv` `apd` `rm` `check` など) で、ファイルの取り込み・取り出しや `STARTUP.CMD` の編集ができる |
+| [`tools/qemu/`](tools/qemu/README.md) | QEMU で超漢字V を起動するコンテナ (`run-qemu.sh`) と、操作ツール `btctl` (シリアルの CLI でコマンド実行、画面のスクリーンショット、マウス操作、キー入力) |
+| [`driver/qemukbpd/`](driver/qemukbpd/README.md) | QEMU 用 キーボード + 絶対座標マウスドライバ (lowkbpd の代わり。ドラッグ可) |
+| [`driver/qemumouse/`](driver/qemumouse/README.md) | QEMU 用 絶対座標マウスドライバ (lowkbpd と併用。ドラッグ不可のため qemukbpd を推奨) |
+| [`driver/kbprobe/`](driver/kbprobe/README.md) | 調査用: kbpd のキーマップを出力 (lowkbpd のキートップコード表つき) |
+| [`driver/kbpdsniff/`](driver/kbpdsniff/README.md) | 調査用: ダミーの kbpd。実 IO ドライバ (lowkbpd など) が送るメッセージをシリアルに出力 |
+| `.github/workflows/` | `driver/*/src` の変更を検知してドライバをビルドし、`driver/*/bin/` をコミットする GitHub Actions |
+
+各ドライバのディレクトリは `src/` (ソース)、`build.sh` (開発環境コンテナでビルド)、`install.sh` (bfsk でイメージに組み込み)、
+`bin/` (ビルド済みバイナリ) という同じ構成です。
 
 ## ビルドからディスクイメージへの書き込み・実行まで
 
@@ -93,6 +96,33 @@ QEMU で動かすときの注意点 (ネットワークアダプタ、DEBUGMODE�
 
 `driver/*/src` の変更を main に push すると、GitHub Actions (`.github/workflows/build-drivers.yml`) が
 同じ開発環境でビルドし、`driver/*/bin/` を更新してコミットします。
+
+## Claude (AI エージェント) からの開発
+
+ビルド、ディスクイメージへの取り込み、QEMU での実行、結果の確認がすべてコマンドラインで完結するため、
+Claude Code のような AI エージェントがソースの変更から動作確認までを繰り返して開発できます。
+このリポジトリのツールとドライバも、その方法で作られています。
+
+| 作業 | コマンド |
+|------|----------|
+| ビルド | `podman run --rm -v $PWD:/workspace:Z btron3sdk:latest bash /workspace/driver/<名前>/build.sh` |
+| イメージへの取り込み | `driver/<名前>/install.sh disk.img debug` / `python3 tools/bfsk/bfsk.py disk.img recv ...` |
+| 起動・停止 | `tools/qemu/run-qemu.sh disk.img` / `tools/qemu/run-qemu.sh stop` (`QEMU_SNAPSHOT=1 tools/qemu/run-qemu.sh ...` でイメージを書き換えない) |
+| ログの取得 | `disk.img` と同じディレクトリの `serial.log` (起動ログ、DEBUGMODE のデバッグ出力、CLI の出力) |
+| 超漢字の CLI | `tools/qemu/btctl cli 'ref sys'` など |
+| 画面の確認 | `tools/qemu/btctl screen shot.png` (エージェントは PNG を読んで画面を確認できる) |
+| マウス操作 | `tools/qemu/btctl move X Y` / `click X Y` / `wheel up` (キー入力やドラッグは QMP の `input-send-event` で送れる) |
+| 停止後のファイル確認 | `python3 tools/bfsk/bfsk.py disk.img tp /SYS/STARTUP.CMD` / `check` |
+
+進め方の例:
+
+1. ソースを修正し、デバッグ版 (`DEBUGMODE 1`) をビルドする
+2. 元のイメージのコピーに `install.sh ... debug` で組み込み、`QEMU_SNAPSHOT=1` で起動する
+3. `serial.log`・`btctl cli`・`btctl screen` で動作を確認し、`btctl` や QMP で入力を与えて試験する
+4. 問題があれば 1 に戻る。終わったら仮想マシンを止め、作業用イメージを消す
+
+KVM が使えない環境でも動きます (起動に 30〜50 秒ほど)。QEMU はホストに直接入れず、
+`tools/qemu/Containerfile` のコンテナで動かすことを前提にしています。
 
 ## ビルド済みサンプル
 
