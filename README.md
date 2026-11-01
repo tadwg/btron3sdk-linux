@@ -1,6 +1,6 @@
 # BTRON3 (超漢字V) Cross Development Environment on Linux
 
-> このリポジトリのコードは [Claude Sonnet 4.6](https://www.anthropic.com/claude) (Anthropic) の支援を受けて書かれました。
+> このリポジトリのツールとドライバは、[Claude](https://www.anthropic.com/claude) からこれらのツールを呼び出して開発しました ([Claude (AI エージェント) からの開発](#claude-ai-エージェント-からの開発))。
 
 超漢字V 向けのクロスコンパイル環境を Linux 上の Podman (または Docker) コンテナで構築します。
 
@@ -101,7 +101,6 @@ QEMU で動かすときの注意点 (ネットワークアダプタ、DEBUGMODE�
 
 ビルド、ディスクイメージへの取り込み、QEMU での実行、結果の確認がすべてコマンドラインで完結するため、
 Claude Code のような AI エージェントがソースの変更から動作確認までを繰り返して開発できます。
-このリポジトリのツールとドライバも、その方法で作られています。
 
 | 作業 | コマンド |
 |------|----------|
