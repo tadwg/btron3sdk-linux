@@ -10,8 +10,8 @@ kbpd へは `INP_KEY` でキーボード ID 0x41 として送られています 
 - 拡張キーは 0x80 以降の独自の番号 (下の表のとおり)
 - PrintScreen は SysRq と同じ 0x53
 - Pause、Menu (アプリケーションキー)、NumLock はキーマップに現れない (lowkbpd 内で処理されている可能性がある)
-- QEMU の `hiragana` と `katakanahiragana` はどちらもスキャンコード 0x70 だが、キートップコードは 0x70 と 0x77 で異なる
-  (QEMU 側の変換で別のコードになっている可能性があり、要確認)
+- QEMU の `katakanahiragana` (106 キーボードのカタカナ/ひらがなキー) はスキャンコード 0x70 でキートップ 0x77、
+  `hiragana` はスキャンコード 0x77 でキートップ 0x70 (どちらも XOR 7 の規則どおり)
 
 ## 対応表
 
@@ -95,7 +95,7 @@ kbpd へは `INP_KEY` でキーボード ID 0x41 として送られています 
 | `muhenkan` | 無変換 | 7B | 0x7C |
 | `spc` | Space | 39 | 0x3E |
 | `henkan` | 変換 | 79 | 0x7E |
-| `hiragana` | カタカナ/ひらがな (hiragana) | 70 | 0x70 |
+| `hiragana` | ひらがな (hiragana) | 77 | 0x70 |
 | `katakanahiragana` | カタカナ/ひらがな (katakanahiragana) | 70 | 0x77 |
 | `alt_r` | 右Alt | E0 38 | 0x87 |
 | `meta_r` | 右Windows | E0 5C | 0x9A |
