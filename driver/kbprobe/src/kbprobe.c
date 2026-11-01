@@ -39,10 +39,9 @@ static VOID probe_task(W *p)
             if (!diff) continue;
             for (b = 0; b < 8; b++) {
                 if (diff & (1 << b)) {
-                    /* ビット順は仕様に記載が無いので両方の解釈を出す */
-                    DEBUG_PRINT(("kbprobe: %s 0x%02X (msb:0x%02X)\n",
-                                 (km[i] & (1 << b)) ? "DOWN" : "UP",
-                                 i * 8 + b, i * 8 + (7 - b)));
+                    /* キーマップは各バイトの最上位ビットが先 (kbpdsniff で確認) */
+                    DEBUG_PRINT(("kbprobe: %s 0x%02X\n",
+                                 (km[i] & (1 << b)) ? "DOWN" : "UP", i * 8 + (7 - b)));
                 }
             }
             gLast[i] = km[i];
