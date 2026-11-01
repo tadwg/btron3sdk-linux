@@ -25,9 +25,13 @@
 
 /* ---- ドライバ用ヘッダ ---- */
 #include <driver/kbpd.h>        /* PdInput, PdInput2, DN_KPINPUT, PDIN_XMAX, PDIN_YMAX */
+#include <driver/pcat/sys.h>    /* in_w, out_w                         */
+#include <kernel/segment.h>     /* ER_OK, ER_NOSPT などの定義を含む      */
+#include <driver/hwres.h>
 #include <bsys/cons_io.h>
 #include <util/debug.h>         /* DEBUG_PRINT */
 #include <tstring.h>            /* eucstotcs   */
+#include <kernel/util.h>
 
 /* ---- btron/device.h の必要分 ---- */
 #ifndef D_READ
