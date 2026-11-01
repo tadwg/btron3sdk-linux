@@ -1,0 +1,61 @@
+# ドライバのビルド: src の変更を main に push すると、btron3sdk コンテナでビルドし、
+# driver/*/bin/ を更新してコミットする.
+name: build-drivers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'driver/*/src/**'
+      - 'driver/*/build.sh'
+      - 'Dockerfile'
+      - '.github/workflows/build-drivers.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-drivers-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # brightv 開発環境のイメージ (公開はしない. GitHub Actions のキャッシュで再利用)
+      - name: Build btron3sdk image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: btron3sdk:latest
+          cache-from: type=gha,scope=btron3sdk
+          cache-to: type=gha,scope=btron3sdk,mode=max
+
+      - name: Build drivers
+        run: |
+          for b in driver/*/build.sh; do
+            echo "=== $b"
+            docker run --rm -v "$PWD":/workspace btron3sdk:latest bash "/workspace/$b"
+          done
+          sudo chown -R "$(id -u):$(id -g)" driver
+
+      - name: Commit bin/
+        run: |
+          git add driver/*/bin
+          if git diff --cached --quiet; then
+            echo "no changes"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update driver binaries [skip ci]
+
+          Built by GitHub Actions from ${GITHUB_SHA}"
+          git push

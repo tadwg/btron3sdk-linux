@@ -41,6 +41,9 @@ podman run --rm -v $PWD:/workspace:Z btron3sdk:latest bash /workspace/driver/qem
 
 `driver/qemumouse/bin/` に `qemumouse` と `qemumouse.debug` ができます。
 
+GitHub では、`driver/*/src` の変更を main に push すると GitHub Actions (`.github/workflows/build-drivers.yml`)
+が同じ手順でビルドし、`bin/` を更新してコミットします (手動実行も可)。
+
 ## 導入
 
 仮想マシンを止めた状態で、ディスクイメージ (raw / VMDK / VDI) に組み込みます。
