@@ -39,7 +39,7 @@ bin/qemumouse.debug   デバッグビルド (DEBUG_PRINT 有効. DEBUGMODE 1 の
 リポジトリ直下で:
 
 ```bash
-podman build -t btron3sdk:latest .
+podman build -t btron3sdk:latest sdk
 podman run --rm -v $PWD:/workspace:Z btron3sdk:latest bash /workspace/driver/qemumouse/build.sh
 ```
 

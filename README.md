@@ -21,9 +21,9 @@
 ## ビルド
 
 ```bash
-podman build -t btron3sdk:latest .
+podman build -t btron3sdk:latest sdk
 # または
-docker build -t btron3sdk:latest .
+docker build -t btron3sdk:latest sdk
 ```
 
 ビルドには数分かかります（アーカイブのダウンロード含む）。
@@ -54,17 +54,16 @@ make BD=$BD GNUs=$GNUs GNU_BD=$GNU_BD GNUi386=$GNUi386
 ### 起動スクリプトを使う
 
 ```bash
-chmod +x run-btron3sdk.sh
-./run-btron3sdk.sh            # 開発シェル
-./run-btron3sdk.sh gterm      # gterm デバッグ接続（TCP 9999）
+sdk/run-btron3sdk.sh            # 開発シェル
+sdk/run-btron3sdk.sh gterm      # gterm デバッグ接続（TCP 9999）
 ```
 
 ## ディレクトリ構成
 
 | パス | 内容 |
 |------|------|
-| `Dockerfile` | クロス開発環境 (btron3sdk) のコンテナ定義 |
-| `run-btron3sdk.sh` | 開発環境コンテナの起動スクリプト |
+| `sdk/Dockerfile` | クロス開発環境 (btron3sdk) のコンテナ定義 |
+| `sdk/run-btron3sdk.sh` | 開発環境コンテナの起動スクリプト (カレントディレクトリを `/workspace` にマウント) |
 | [`tools/bfsk/`](tools/bfsk/README.md) | BTRON ディスクイメージ (raw / VMDK / VDI) を Linux から読み書きする Python ツール。超漢字の CLI に近いコマンド (`ls` `tp` `recv` `apd` `rm` `check` など) で、ファイルの取り込み・取り出しや `STARTUP.CMD` の編集ができる |
 | [`tools/qemu/`](tools/qemu/README.md) | QEMU で超漢字V を起動するコンテナ (`run-qemu.sh`) と、操作ツール `btctl` (シリアルの CLI でコマンド実行、画面のスクリーンショット、マウス操作、キー入力) |
 | [`driver/qemukbpd/`](driver/qemukbpd/README.md) | QEMU 用 キーボード + 絶対座標マウスドライバ (lowkbpd の代わり。ドラッグ可) |
@@ -82,7 +81,7 @@ bfsk と QEMU を使うと、超漢字V のプログラムを「ビルド → �
 コマンドラインだけで行えます (例: QEMU 用キーボード・マウスドライバ)。
 
 ```bash
-podman build -t btron3sdk:latest .                                   # 開発環境
+podman build -t btron3sdk:latest sdk                                   # 開発環境
 podman build -t btron-qemu:latest -f tools/qemu/Containerfile tools/qemu
 podman run --rm -v $PWD:/workspace:Z btron3sdk:latest bash /workspace/driver/qemukbpd/build.sh
 driver/qemukbpd/install.sh disk.img debug                            # bfsk でイメージに組み込み
@@ -143,7 +142,7 @@ KVM が使えない環境でも動きます (起動に 30〜50 秒ほど)。QEMU
 
 ## ライセンス
 
-このリポジトリの Dockerfile および起動スクリプトは MIT ライセンスです。
+このリポジトリの `sdk/` の Dockerfile および起動スクリプトは MIT ライセンスです。
 
 ダウンロードされる brightv アーカイブは Personal Media Corporation の著作物であり、
 使用条件については [超漢字開発者向けページ](https://www.chokanji.com/developer/) をご確認ください。

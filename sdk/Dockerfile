@@ -9,7 +9,7 @@
 # パッチ適用・サンプルビルドまで行う。
 #
 # 使い方:
-#   podman build -t btron3sdk:latest .
+#   podman build -t btron3sdk:latest sdk
 #   podman run --rm -it -v $PWD:/workspace:z btron3sdk:latest
 # =============================================================================
 

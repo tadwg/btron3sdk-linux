@@ -8,7 +8,7 @@ on:
     paths:
       - 'driver/*/src/**'
       - 'driver/*/build.sh'
-      - 'Dockerfile'
+      - 'sdk/**'
       - '.github/workflows/build-drivers.yml'
   workflow_dispatch:
 
@@ -31,7 +31,7 @@ jobs:
       - name: Build btron3sdk image
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: sdk
           load: true
           push: false
           tags: btron3sdk:latest

@@ -2,9 +2,9 @@
 # BTRON3 (超漢字V) 開発環境コンテナ起動スクリプト
 #
 # 使い方:
-#   ./run-btron3sdk.sh               # 開発シェルに入る
-#   ./run-btron3sdk.sh gterm         # gterm 起動 (TCP 9999 経由)
-#   ./run-btron3sdk.sh gterm HOST PORT  # 指定ホストに gterm 接続
+#   sdk/run-btron3sdk.sh               # 開発シェルに入る
+#   sdk/run-btron3sdk.sh gterm         # gterm 起動 (TCP 9999 経由)
+#   sdk/run-btron3sdk.sh gterm HOST PORT  # 指定ホストに gterm 接続
 
 IMAGE="${BTRON3SDK_IMAGE:-btron3sdk:latest}"
 WORKDIR="${BTRON3SDK_WORKDIR:-$PWD}"
