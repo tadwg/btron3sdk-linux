@@ -1,0 +1,4 @@
+# QEMU (i386) 実行用コンテナ
+#   podman build -t btron-qemu:latest -f tools/qemu/Containerfile tools/qemu
+FROM docker.io/library/alpine:3.20
+RUN apk add --no-cache qemu-system-i386 python3

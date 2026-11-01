@@ -65,6 +65,23 @@ chmod +x run-btron3sdk.sh
 Dockerfile          コンテナビルド定義
 run-btron3sdk.sh    コンテナ起動スクリプト
 tools/bfsk/         BTRON ディスクイメージ操作ツール (詳細は tools/bfsk/README.md)
+tools/qemu/         QEMU で超漢字V を起動・操作するツール (詳細は tools/qemu/README.md)
+driver/qemumouse/   QEMU 用 絶対座標マウスドライバ (詳細は driver/qemumouse/README.md)
+```
+
+## ビルドからディスクイメージへの書き込み・実行まで
+
+bfsk と QEMU を使うと、超漢字V のプログラムを「ビルド → イメージへの書き込み → 起動 → 確認」まで
+コマンドラインだけで行えます (例: QEMU 用マウスドライバ)。
+
+```bash
+podman build -t btron3sdk:latest .                                   # 開発環境
+podman build -t btron-qemu:latest -f tools/qemu/Containerfile tools/qemu
+podman run --rm -v $PWD:/workspace:Z btron3sdk:latest bash /workspace/driver/qemumouse/build.sh
+driver/qemumouse/install.sh disk.img debug                           # bfsk でイメージに組み込み
+tools/qemu/run-qemu.sh disk.img                                      # 起動
+tools/qemu/btctl mice                                                # 絶対座標モードか確認
+tools/qemu/run-qemu.sh stop
 ```
 
 ## ビルド済みサンプル
