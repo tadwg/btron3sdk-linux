@@ -31,7 +31,9 @@
 #include <driver/hwres.h>
 #include <bsys/cons_io.h>
 #include <util/debug.h>         /* DEBUG_PRINT */
-#include <tstring.h>            /* eucstotcs   */
+#include <tstring.h>            /* eucstotcs, tcstoeucs */
+#include <bstdio.h>             /* printf (ログ) */
+#include <bstring.h>            /* strlen, strncmp */
 #include <kernel/util.h>
 
 /* ---- btron/device.h の必要分 ---- */

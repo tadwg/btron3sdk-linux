@@ -10,8 +10,11 @@
  *     ・テンキーのキーは KeyInStat.tenkey = 1
  *     ・キーリピート (押しっぱなしで繰り返される make code) は送らない
  * - マウス: vmmouse (VMware バックドア) を絶対座標モードにして INP_PD / INP_PD2 で送る
- * - PS/2 マウス (i8042 の補助ポート) は無効にする. QEMU は vmmouse のイベントごとにダミーの
- *   PS/2 パケットを作るが、補助ポートが無効ならゲストには送られない (二重のイベントを防ぐ)
+ * - 割り込み待ち: キーボード (IRQ1) と PS/2 マウス (IRQ12) の割り込みでタスクを起こす.
+ *   QEMU は vmmouse のイベントごとにダミーの PS/2 マウスのパケットを作るので、その IRQ12 を
+ *   「vmmouse にデータがある」合図に使い、パケット自体は捨てる (kbpd には送らない. 二重のイベントを防ぐ).
+ *   取りこぼしに備えて FALLBACK_MS ごとにも確認する. 引数 poll で従来の 10ms ポーリングにする
+ * - 引数 log / log2 / log3 で動作ログをコンソール (シリアル) に出す (下記 LOG)
  * - INP_FLG でコマンド用イベントフラグを登録し、入力モード (LED) とサスペンド / リジュームに対応する
  *
  * 前提: STARTUP.CMD で lowkbpd (と qemumouse, vmwdrv) を読み込まないこと.
@@ -35,8 +38,10 @@
 #define ST_OBF          0x01        /* 出力バッファにデータあり */
 #define ST_IBF          0x02        /* 入力バッファが一杯       */
 #define ST_AUX          0x20        /* データは補助ポート (マウス) から */
-/* コマンドバイト: 変換 (set1) 有効, 補助ポート無効, 割り込み無効 (ポーリング), SYS */
-#define I8042_CMDBYTE   0x64
+/* コマンドバイト */
+#define I8042_CMDBYTE_POLL  0x64    /* 変換 (set1) 有効, 補助ポート無効, 割り込み無効, SYS */
+#define I8042_CMDBYTE_IRQ   0x47    /* 変換 (set1) 有効, 両ポート有効, 両方の割り込み有効, SYS */
+#define IV_AUX              INTVEC(IRQ12)
 
 #define KB_LED_SCROLL   0x01
 #define KB_LED_NUM      0x02
@@ -69,7 +74,8 @@
 
 #define TASK_PRIORITY   30
 #define TASK_STACKSIZE  2048
-#define POLL_INTERVAL   10          /* ms */
+#define POLL_INTERVAL   10          /* ms (poll 指定時) */
+#define FALLBACK_MS     500         /* 割り込み待ちのときの確認間隔 */
 #define NKEYMSG         32          /* キー送信バッファ数 */
 
 /* ================================================================ 大域変数 */
@@ -80,6 +86,15 @@ static volatile BOOL gLoop = TRUE;
 static volatile BOOL gSuspended = FALSE;
 static volatile W    gActive = 0;   /* 動作中のタスク数 */
 static BOOL gMouse = FALSE;         /* vmmouse を使えるか */
+static ID   gIrqFlg = -1;           /* 割り込みハンドラ → io_task */
+static BOOL gUseIrq = FALSE;        /* 割り込み待ちで動いているか */
+static BOOL gIntKbDef = FALSE, gIntAuxDef = FALSE;
+static volatile UW gIntKb = 0, gIntAux = 0;     /* 割り込み回数 */
+#ifdef DEBUG
+static W    gLog = 2;               /* デバッグ版は既定で log2 */
+#else
+static W    gLog = 0;               /* 0: なし, 1: キー・ボタン・コマンド・異常, 2: +移動・統計, 3: +全バイト */
+#endif
 
 static KeyInput gKeyMsg[NKEYMSG];
 static W        gKeyIdx = 0;
@@ -93,6 +108,15 @@ static W    gMode = AlphaMode;      /* kbpd の入力モード */
 static BOOL gE0 = FALSE;
 static W    gE1 = 0;                /* E1 シーケンスの残りバイト数 */
 static W    gLastX = -1, gLastY = -1, gLastBtn = -1;
+
+/* ================================================================ ログ */
+static VOID log_head(VOID)
+{
+    SYSTIME t;
+    get_tim(&t);
+    printf("qemukbpd %u.%03u: ", (UW)((t / 1000) % 100000), (UW)(t % 1000));
+}
+#define LOG(lv, args)   do { if (gLog >= (lv)) { log_head(); printf args; } } while (0)
 
 /* ================================================================ 共通 */
 static W wait_read(volatile UW *stat)   /* read フラグ (先頭ワードの bit0) を待つ */
@@ -141,15 +165,19 @@ static VOID kb_set_led(VOID)
     kbc_data(led);
 }
 
-static W kbc_init(VOID)
+static W kbc_init(BOOL irq)
 {
     kbc_flush();
     kbc_cmd(0x60);                  /* コマンドバイト書き込み */
-    kbc_data(I8042_CMDBYTE);
-    kbc_cmd(0xA7);                  /* 補助ポート (マウス) 無効 */
+    kbc_data(irq ? I8042_CMDBYTE_IRQ : I8042_CMDBYTE_POLL);
+    kbc_cmd(irq ? 0xA8 : 0xA7);     /* 補助ポート (マウス) 有効 / 無効 */
     kbc_cmd(0xAE);                  /* キーボード有効 */
     kbc_flush();
     kbc_data(0xF4);                 /* キーボード: スキャン有効 */
+    if (irq) {                      /* PS/2 マウス: データ送信開始 (割り込みの合図用) */
+        kbc_cmd(0xD4);
+        kbc_data(0xF4);
+    }
     kb_set_led();
     return kbc_wait_in() ? 0 : -(ED_I8042);
 }
@@ -197,7 +225,7 @@ static VOID send_key(W keytop, BOOL press, BOOL tenkey)
     }
     m = &gKeyMsg[gKeyIdx];
     if (wait_read((volatile UW *)&m->stat) < 0) {
-        DEBUG_PRINT(("qemukbpd: key buffer busy, drop 0x%02X\n", keytop));
+        LOG(1, ("key buffer busy, drop 0x%02X\n", keytop));
         return;
     }
     gKeyIdx = (gKeyIdx + 1) % NKEYMSG;
@@ -208,7 +236,7 @@ static VOID send_key(W keytop, BOOL press, BOOL tenkey)
     m->stat.press  = press ? 1 : 0;
     m->stat.tenkey = tenkey ? 1 : 0;
     m->keytop      = keytop;
-    DEBUG_PRINT(("qemukbpd: key 0x%02X %s%s\n", keytop, press ? "down" : "up", tenkey ? " (tenkey)" : ""));
+    LOG(1, ("key 0x%02X %s%s\n", keytop, press ? "down" : "up", tenkey ? " (tenkey)" : ""));
     snd_msg(gMbx, (T_MSG *)m);
 }
 
@@ -305,6 +333,8 @@ static VOID post_pointer(W vx, W vy, W main_btn, W sub_btn, W wheel, W mid_btn)
         gPdMsg.xpos = (H)ox;
         gPdMsg.ypos = (H)oy;
         snd_msg(gMbx, (T_MSG *)&gPdMsg);
+    } else {
+        LOG(1, ("pd buffer busy, drop\n"));
     }
     if (wheel != 0 && wait_read((volatile UW *)&gPdMsg2.stat) == 0) {
         memset(&gPdMsg2, 0, sizeof(gPdMsg2));
@@ -315,13 +345,18 @@ static VOID post_pointer(W vx, W vy, W main_btn, W sub_btn, W wheel, W mid_btn)
     }
 }
 
-static VOID mouse_poll(VOID)
+static W mouse_poll(VOID)       /* 読んだパケット数を返す */
 {
     BdRegs r;
     UW     n;
+    W      cnt = 0;
 
     backdoor(VMPORT_CMD_VMMOUSE_STATUS, 0, &r);
-    if ((r.eax & VMMOUSE_ERROR) == VMMOUSE_ERROR) { vmmouse_enable(); return; }
+    if ((r.eax & VMMOUSE_ERROR) == VMMOUSE_ERROR) {
+        LOG(1, ("vmmouse error status 0x%08X, re-enable\n", r.eax));
+        vmmouse_enable();
+        return 0;
+    }
     n = r.eax & 0xffff;
     while (n >= 4 && gLoop) {
         W x, y, btn, wheel;
@@ -331,29 +366,105 @@ static VOID mouse_poll(VOID)
         x     = (W)(r.ebx & 0xffff);
         y     = (W)(r.ecx & 0xffff);
         wheel = (W)(B)(r.edx & 0xff);
+        cnt++;
+        if (btn != gLastBtn || wheel != 0) {
+            LOG(1, ("pd %u,%u btn 0x%02X wheel %d\n", (UW)x, (UW)y, (UW)btn, wheel));
+        } else if (x != gLastX || y != gLastY) {
+            LOG(2, ("pd %u,%u\n", (UW)x, (UW)y));
+        }
         if (x != gLastX || y != gLastY || btn != gLastBtn || wheel != 0) {
             post_pointer(x, y, (btn & VMMOUSE_LEFT_BUTTON) ? 1 : 0, (btn & VMMOUSE_RIGHT_BUTTON) ? 1 : 0,
                          wheel, (btn & VMMOUSE_MIDDLE_BUTTON) ? 1 : 0);
             gLastX = x;  gLastY = y;  gLastBtn = btn;
         }
     }
+    return cnt;
+}
+
+/* ================================================================ 割り込み */
+static VOID kb_inthdr(VOID)
+{
+    gIntKb++;
+    set_flg(gIrqFlg, 1);
+    EndOfInt(IV_KB);
+}
+
+static VOID aux_inthdr(VOID)
+{
+    gIntAux++;
+    set_flg(gIrqFlg, 1);
+    EndOfInt(IV_AUX);
+}
+
+static BOOL def_handler(IntVector vec, FP hdr)
+{
+    T_DINT dint;
+    ER     er;
+    memset(&dint, 0, sizeof(dint));
+    dint.intatr = TA_HLNG;
+    dint.inthdr = hdr;
+    er = def_int(vec, &dint);
+    if (er != E_OK) LOG(1, ("def_int(0x%02X) failed %d\n", (UW)vec, er));
+    return er == E_OK;
+}
+
+static VOID irq_setup(VOID)
+{
+    T_CFLG cflg;
+    memset(&cflg, 0, sizeof(cflg));
+    cflg.flgatr = TA_WSGL;
+    gIrqFlg = vcre_flg(&cflg);
+    if (gIrqFlg < 0) { LOG(1, ("vcre_flg failed %d\n", gIrqFlg)); return; }
+    gIntKbDef  = def_handler(IV_KB,  (FP)kb_inthdr);
+    gIntAuxDef = gIntKbDef && def_handler(IV_AUX, (FP)aux_inthdr);
+    gUseIrq = gIntKbDef && gIntAuxDef;
+}
+
+static VOID irq_release(VOID)
+{
+    if (gUseIrq) { DisableInt(IV_KB); DisableInt(IV_AUX); }
+    if (gIntKbDef)  def_int(IV_KB, NULL);
+    if (gIntAuxDef) def_int(IV_AUX, NULL);
+    gIntKbDef = gIntAuxDef = FALSE;
 }
 
 /* ================================================================ タスク */
-static VOID poll_task(W *p)
+static VOID io_task(W *p)
 {
-    W i;
+    W    i, aux, nto = 0;
+    BOOL timeout;
     gActive++;
     while (gLoop) {
-        dly_tsk(POLL_INTERVAL);
-        for (i = 0; i < 32; i++) {          /* キーボード (補助ポートのデータは捨てる) */
+        if (gUseIrq) {
+            UINT ptn;
+            timeout = twai_flg(&ptn, gIrqFlg, 1, TWF_ORW | TWF_CLR, FALLBACK_MS) != E_OK;
+        } else {
+            dly_tsk(POLL_INTERVAL);
+            timeout = TRUE;
+        }
+        aux = 0;
+        for (i = 0; i < 64; i++) {          /* キーボード (補助ポートのデータは合図として捨てる) */
             UB st = in_b(I8042_STAT);
             UB b;
             if (!(st & ST_OBF)) break;
             b = in_b(I8042_DATA);
-            if (!(st & ST_AUX)) kb_byte(b);
+            if (st & ST_AUX) {
+                aux++;
+                LOG(3, ("aux 0x%02X\n", b));
+            } else {
+                LOG(3, ("kbd 0x%02X\n", b));
+                if (gUseIrq && timeout) LOG(1, ("key data found without interrupt\n"));
+                kb_byte(b);
+            }
         }
-        if (gMouse) mouse_poll();
+        if (gMouse && (aux > 0 || timeout)) {
+            W n = mouse_poll();
+            if (gUseIrq && timeout && n > 0) LOG(1, ("vmmouse data found without interrupt (%d)\n", n));
+        }
+        if (gUseIrq && timeout && ++nto >= 120) {   /* 約 1 分ごとの統計 */
+            nto = 0;
+            LOG(2, ("irq kbd %u aux %u\n", gIntKb, gIntAux));
+        }
     }
     gActive--;
     exd_tsk();
@@ -368,7 +479,7 @@ static VOID cmd_task(W *p)
         set_flg(gFlg, 0x80000000);                         /* コマンド入力 READY */
         if (twai_flg(&cmd, gFlg, 0x7fffffff, TWF_ORW | TWF_CLR, 200) != E_OK) continue;
         cmd &= 0x7fffffff;
-        DEBUG_PRINT(("qemukbpd: command 0x%08X\n", cmd));
+        LOG(1, ("command 0x%08X\n", cmd));
         if (cmd == SuspendKBPD) {
             gSuspended = TRUE;
         } else if (cmd == ResumeKBPD) {
@@ -413,6 +524,30 @@ static VOID send_flg(BOOL reg)
     snd_msg(gMbx, (T_MSG *)&gFlgMsg);
 }
 
+/* ================================================================ 引数 */
+static BOOL has_word(const B *s, const B *w)
+{
+    W n = strlen(w);
+    while (*s) {
+        if (strncmp(s, w, n) == 0 && (s[n] == 0 || s[n] == ' ' || s[n] == '\t' || s[n] == ',')) return TRUE;
+        while (*s && *s != ' ' && *s != '\t' && *s != ',') s++;
+        while (*s == ' ' || *s == '\t' || *s == ',') s++;
+    }
+    return FALSE;
+}
+
+static BOOL parse_args(TC *arg)     /* 戻り値: poll 指定 */
+{
+    B buf[128];
+    buf[0] = 0;
+    if (arg != NULL && tc_strlen(arg) < 40) tcstoeucs(buf, arg);
+    if (has_word(buf, "log"))  gLog = 1;
+    if (has_word(buf, "log2")) gLog = 2;
+    if (has_word(buf, "log3")) gLog = 3;
+    LOG(1, ("args \"%s\"\n", buf));
+    return has_word(buf, "poll");
+}
+
 /* ================================================================ エントリ */
 ERR main(Bool StartUp, TC *arg)
 {
@@ -420,18 +555,22 @@ ERR main(Bool StartUp, TC *arg)
     W      rsize, i;
     ERR    er;
     T_CFLG cflg;
-
-    DEBUG_PRINT(("qemukbpd: main(%d) build=" __DATE__ " " __TIME__ "\n", StartUp));
+    BOOL   poll;
 
     if (TRUE != StartUp) {                  /* 終了処理 */
+        LOG(1, ("stop\n"));
         gLoop = FALSE;
+        if (gUseIrq) set_flg(gIrqFlg, 1);
         while (gActive > 0) dly_tsk(POLL_INTERVAL);
+        irq_release();
         send_flg(FALSE);
         if (gMouse) vmmouse_disable();
         if (gKbpdDD > 0) b_cls_dev(gKbpdDD, 0, NULL);
         return ER_OK;
     }
 
+    poll = parse_args(arg);
+    LOG(1, ("start, build " __DATE__ " " __TIME__ "\n"));
     for (i = 0; i < NKEYMSG; i++) gKeyMsg[i].stat.read = 1;
     gPdMsg.stat.read = 1;  gPdMsg2.stat.read = 1;  gFlgMsg.stat.read = 1;
     gLoop = TRUE;
@@ -442,19 +581,26 @@ ERR main(Bool StartUp, TC *arg)
     er = b_rea_dev(gKbpdDD, DN_KPINPUT, (B *)&gMbx, sizeof(ID), &rsize, NULL);
     if (er != 0) { b_cls_dev(gKbpdDD, 0, NULL); return ER_NOSPT | ED_KBPD_MAILBOX; }
 
-    if (kbc_init() < 0) { b_cls_dev(gKbpdDD, 0, NULL); return ER_NOSPT | ED_I8042; }
+    if (!poll) irq_setup();
+    if (kbc_init(gUseIrq) < 0) {
+        irq_release();
+        b_cls_dev(gKbpdDD, 0, NULL);
+        return ER_NOSPT | ED_I8042;
+    }
+    if (gUseIrq) { EnableInt(IV_KB); EnableInt(IV_AUX); }
     gMouse = vmmouse_enable();
-    DEBUG_PRINT(("qemukbpd: kbpd mbx=%d vmmouse=%d\n", gMbx, gMouse));
+    LOG(1, ("kbpd mbx %d, vmmouse %s, %s\n", gMbx, gMouse ? "absolute" : "not found",
+            gUseIrq ? "interrupt (IRQ1/IRQ12)" : "polling 10ms"));
 
     memset(&cflg, 0, sizeof(cflg));
     cflg.flgatr = TA_WMUL;          /* kbpd と qemukbpd の両方が待つ */
     gFlg = vcre_flg(&cflg);
     if (gFlg < 0) { b_cls_dev(gKbpdDD, 0, NULL); return ER_NOSPT | ED_CRE_FLG; }
 
-    if ((er = start_task((FP)poll_task)) != ER_OK) { b_cls_dev(gKbpdDD, 0, NULL); return er; }
+    if ((er = start_task((FP)io_task)) != ER_OK) { irq_release(); b_cls_dev(gKbpdDD, 0, NULL); return er; }
     if ((er = start_task((FP)cmd_task)) != ER_OK) { gLoop = FALSE; return er; }
     send_flg(TRUE);
 
-    DEBUG_PRINT(("qemukbpd: startup OK\n"));
+    LOG(1, ("startup OK\n"));
     return ER_OK;
 }
