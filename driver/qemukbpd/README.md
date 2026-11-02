@@ -109,8 +109,9 @@ kerext	qemukbpd	!28	log
 
 ```
 qemukbpd 27200.070: kbpd mbx 1, vmmouse absolute, interrupt (IRQ1/IRQ12)
-qemukbpd 27265.120: key 0x1E down
-qemukbpd 27265.420: pd 16014,2562 btn 0x20 wheel 0
+qemukbpd 27200.070: command 0x03000001
+qemukbpd 27220.300: pd 2562,8372 btn 0x20 wheel 0
+qemukbpd 27220.450: pd 2562,8372 btn 0x00 wheel 0
 qemukbpd 27390.870: irq kbd 6 aux 85
 ```
 
