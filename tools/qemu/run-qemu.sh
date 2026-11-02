@@ -11,6 +11,7 @@
 #   QEMU_NIC    NIC のモデル (既定 pcnet. 体験版はネットワークアダプタが必須)
 #   QEMU_MEM    メモリ MB (既定 256)
 #   QEMU_SNAPSHOT=1  イメージに書き込まない (変更は QEMU 終了時に捨てる)
+#   QEMU_RTC    時計の初期値 (既定 localtime. 例: 2026-10-01T09:00:00)
 #
 # IMAGE と同じディレクトリに serial.sock / serial.log / qmp.sock を作る.
 # 操作は tools/qemu/btctl (シリアルの CLI、画面取得、マウス) を使う.
@@ -46,5 +47,5 @@ podman run -d --name "$NAME" --network none --memory 700m \
     -chardev socket,id=s0,path=/w/serial.sock,server=on,wait=off,logfile=/w/serial.log \
     -serial chardev:s0 \
     -qmp unix:/w/qmp.sock,server=on,wait=off \
-    -rtc base=localtime -no-reboot $SNAP >/dev/null
+    -rtc base="${QEMU_RTC:-localtime}" -no-reboot $SNAP >/dev/null
 echo "started $NAME ($FILE). serial log: $DIR/serial.log"
