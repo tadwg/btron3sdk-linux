@@ -118,6 +118,23 @@ qemukbpd 27390.870: irq kbd 6 aux 85
 `pd` の座標は vmmouse の値 (0〜65535)、`btn` は左 0x20 / 右 0x10 / 中 0x08 です。
 `... found without interrupt` が出る場合は、割り込みが届いていません (`poll` を試してください)。
 
+## Windows のホストでかな漢字変換ができないとき
+
+QEMU の GTK 表示 (Windows) は、入力を「つかんで (grab)」いるときだけ、低レベルのキーボードフックで
+キーを直接ゲストに送ります。つかんでいないときは通常の Windows のメッセージで受け取るため、ホストの
+日本語入力 (IME) がオンだとキーを IME に取られ、ゲストにキーが届きません。
+
+- 相対座標のマウス (lowkbpd の PS/2 マウス) では、QEMU のウィンドウを最初にクリックしたときに自動で
+  入力をつかむので、IME の影響を受けません
+- 絶対座標のマウス (qemukbpd・qemumouse の vmmouse) では自動でつかまないので、ホストの IME がオンだと
+  キーを取られます (QEMU 9.0 の `ui/gtk.c` の `gd_button_event`、`ui/win32-kbd-hook.c` で確認)
+
+対策 (いずれか):
+
+- QEMU のウィンドウで Ctrl+Alt+G (メニューの「Grab Input」) を押して入力をつかむ (もう一度押すと解除)
+- QEMU の起動オプションを `-display gtk,grab-on-hover=on` にする (ポインタがウィンドウ上にある間はつかむ)
+- 仮想マシンを使う間は、ホストの IME をオフ (英数) にしておく
+
 ## エラーコード
 
 起動失敗時は `ER_NOSPT (0xFFFD0000)` の下位 16bit に原因が入ります。
