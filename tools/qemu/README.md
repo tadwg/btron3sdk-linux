@@ -66,6 +66,9 @@ QEMU 9.0 (KVM なし) で、超漢字V の体験版イメージ (VMware 用の 4
 - 起動ログの `InitUsbMgr ER_SYS` は USB コントローラが無いためで、動作には影響しません
 - 時計は `-rtc base=localtime` にしています。超漢字V はハードウェア時計をローカル時刻として扱うため、
   UTC のままだと作成したファイルの日時がずれます (日本時間なら 9 時間)
+- Windows 用の QEMU (`qemu-system-i386`、本家 v11.1.3 のビルド) を [tadwg/qemu のリリース](https://github.com/tadwg/qemu/releases/tag/btron-latest)
+  に置いています ([qemu-i386-win64.zip](https://github.com/tadwg/qemu/releases/download/btron-latest/qemu-i386-win64.zip)、
+  説明は [btron/README.md](https://github.com/tadwg/qemu/blob/btron/btron/README.md))
 - Windows のホストで GTK 表示を使い、qemukbpd (絶対座標のマウス) で動かすときは、Ctrl+Alt+G で入力をつかむか
   `-display gtk,grab-on-hover=on` にしてください。つかんでいないと、ホストの日本語入力がオンのときにキーを
   ホストに取られ、ゲストでかな漢字変換ができません (詳細は `driver/qemukbpd/README.md`)
