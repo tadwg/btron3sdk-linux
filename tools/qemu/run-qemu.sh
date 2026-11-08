@@ -12,6 +12,8 @@
 #   QEMU_MEM    メモリ MB (既定 256)
 #   QEMU_SNAPSHOT=1  イメージに書き込まない (変更は QEMU 終了時に捨てる)
 #   QEMU_RTC    時計の初期値 (既定 localtime. 例: 2026-10-01T09:00:00)
+#   QEMU_CPUS   コンテナの CPU 上限 (例: 0.33 で 1 コアの 1/3。既定は上限なし)
+#   QEMU_PODMAN_MEM  コンテナのメモリ上限 (既定 700m。QEMU_MEM を大きくするときに合わせて上げる)
 #
 # IMAGE と同じディレクトリに serial.sock / serial.log / qmp.sock を作る.
 # 操作は tools/qemu/btctl (シリアルの CLI、画面取得、マウス) を使う.
@@ -38,7 +40,7 @@ SNAP=
 [ -n "$QEMU_SNAPSHOT" ] && SNAP=-snapshot
 podman rm -f "$NAME" >/dev/null 2>&1 || true
 rm -f "$DIR/serial.sock" "$DIR/qmp.sock" "$DIR/serial.log"
-podman run -d --name "$NAME" --network none --memory 700m \
+podman run -d --name "$NAME" --network none --memory "${QEMU_PODMAN_MEM:-700m}" ${QEMU_CPUS:+--cpus "$QEMU_CPUS"} \
   -v "$DIR":/w:Z -v "$HERE":/t:ro,Z "$CIMG" \
   qemu-system-i386 -m "${QEMU_MEM:-256}" \
     -drive file="/w/$FILE",format=$FMT,if=ide,index=0 \

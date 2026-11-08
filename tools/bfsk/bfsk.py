@@ -539,7 +539,7 @@ class BFile:
 
     def _walk_indirect(self, block, start, level):
         # 間接インデックス (8バイト: 有効レコード数, 論理ブロックアドレス) を前から列挙
-        # ※ level>0 のファイルは手元のサンプルに無く未検証
+        # レベル 1 / 2 は超漢字V で作ったファイルで確認済み (README「インデックスレベル 1 / 2 の検証」)
         for off in range(start, len(block) - 7, 8):
             cnt, addr = struct.unpack_from('<2I', block, off)
             if addr == 0:
